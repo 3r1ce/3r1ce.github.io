@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CARS Radar Explorer</title>
+    <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+const DEFAULT_RADARS = [
+  { id: "path16", name: "Pathfinder 16", band: "X", pw: 110, apt: 6, bw: 1.32, wt: 33, cost: 32999, iec: "CAT 3", wind: 100, tech: "SS CHIRP", techClass: "ss_pulsecomp", rangeRes: 7.5, rec: true },
+  { id: "drs12a", name: "DRS12A-NXT", band: "X", pw: 100, apt: 6, bw: 1.35, wt: 34, cost: 15333, iec: "None", wind: 70, tech: "SS Doppler", techClass: "ss_doppler", rangeRes: 10, rec: false },
+  { id: "far2228", name: "FAR-2228", band: "X", pw: 600, apt: 6.5, bw: 1.23, wt: 61, cost: 84624, iec: "CAT 2", wind: 100, tech: "SS PulseComp", techClass: "ss_pulsecomp", rangeRes: 7.5, rec: false },
+  { id: "far2238s", name: "FAR-2238S", band: "S", pw: 250, apt: 12, bw: 1.8, wt: 134, cost: 93943, iec: "CAT 2", wind: 100, tech: "SS S-Band", techClass: "ss_pulsecomp", rangeRes: 15, rec: false },
+  { id: "sbs800x", name: "SBS-800 X", band: "X", pw: 300, apt: 12, bw: 1.0, wt: 150, cost: 390000, iec: "VTS", wind: null, tech: "SharpEye", techClass: "ss_coherent", rangeRes: 7.5, rec: false },
+  { id: "sbs800s", name: "SBS-800 S", band: "S", pw: 200, apt: 13, bw: 1.8, wt: 190, cost: 390000, iec: "VTS", wind: null, tech: "SharpEye S", techClass: "ss_coherent", rangeRes: 15, rec: false },
+];
+
+const VESSELS = [
+  { type: 7, label: "Container / tanker", loa: 220, beam: 32, height: 18, rcs_x: 100000, color: "#185FA5" },
+  { type: 6, label: "Cargo / bulk carrier", loa: 136, beam: 20, height: 12, rcs_x: 10000, color: "#378ADD" },
+  { type: 5, label: "Coaster / large OSV", loa: 67, beam: 12, height: 8, rcs_x: 1000, color: "#1D9E75" },
+  { type: 4, label: "Fishing / tug", loa: 35, beam: 8, height: 5, rcs_x: 100, color: "#5DCAA5" },
+  { type: 3, label: "AtoN w/ reflector", loa: 10, beam: 4, height: 3, rcs_x: 10, color: "#BA7517" },
+  { type: 2, label: "Sailing / speedboat", loa: 12, beam: 4, height: 2, rcs_x: 3, color: "#D85A30" },
+  { type: 1, label: "Small open boat", loa: 7, beam: 2.5, height: 1, rcs_x: 1, color: "#A32D2D" },
+];
+
+const freqForBand = (band) => band === "S" ? 3.05e9 : 9.41e9;
+const lamForBand = (band) => 3e8 / freqForBand(band);
+const GfnBand = (ft, band) => { const m = ft * 0.3048; const lam = lamForBand(band); return (4 * Math.PI * m * 0.12 * 0.55) / (lam * lam); };
+const RfnBand = (Pt, Ga, s, band) => {
+  const lam = lamForBand(band);
+  const BW = 1 / 50e-6;
+  return (Pt * Ga * Ga * lam * lam * s / ((4 * Math.PI) ** 3 * 1.38e-23 * 290 * BW * 10 ** (4 / 10) * 10 ** (6 / 10) * 10 ** (13 / 10))) ** 0.25;
+};
+
+const rainAtten = (rainRate, band) => {
+  if (rainRate <= 0) return 0;
+  let k, alpha;
+  if (band === "S") { k = 0.000425; alpha = 0.976; }
+  else { k = 0.0101; alpha = 1.276; }
+  return k * Math.pow(rainRate, alpha);
+};
+
+const rainBackscatterEta = (rainRate, band) => {
+  if (rainRate <= 0) return 0;
+  const lam = lamForBand(band);
+  const Z = 200 * Math.pow(rainRate, 1.6);
+  const Zmm6 = Z * 1e-18;
+  const Kw2 = 0.93;
+  return (Math.PI ** 5 / lam ** 4) * Kw2 * Zmm6;
+};
+
+const TECH_CIF = {
+  magnetron: { cif: 0, rangeRes: 75, label: "Magnetron (non-coherent)", rating: "Moderate" },
+  ss_doppler: { cif: 23, rangeRes: 10, label: "SS Doppler", rating: "Good" },
+  ss_pulsecomp: { cif: 27, rangeRes: 7.5, label: "SS pulse compression", rating: "Good+" },
+  ss_coherent: { cif: 35, rangeRes: 7.5, label: "SS coherent (VTS-grade)", rating: "Very good" },
+};
+const SBAND_CIF_BONUS = 3;
+
+const clutterCIF = (techClass, band) => {
+  const tc = TECH_CIF[techClass] || TECH_CIF.ss_doppler;
+  return tc.cif + (band === "S" ? SBAND_CIF_BONUS : 0);
+};
+const clutterRangeRes = (techClass) => {
+  const tc = TECH_CIF[techClass] || TECH_CIF.ss_doppler;
+  return tc.rangeRes;
+};
+const clutterLabel = (techClass) => {
+  const tc = TECH_CIF[techClass] || TECH_CIF.ss_doppler;
+  return tc.label;
+};
+
+const seaClutterSigma0 = (ss, grazingDeg, band) => {
+  if (ss <= 0) return -999;
+  const ssTable = [-999, -40, -34, -28, -22, -17, -13];
+  const s0base = ss <= 6 ? ssTable[ss] : -13 + (ss - 6) * 3;
+  const grazAdj = 10 * Math.log10(Math.max(0.05, grazingDeg));
+  const bandAdj = band === "S" ? -8 : 0;
+  return s0base + grazAdj + bandAdj;
+};
+
+const effRangeWithEnv = (Pt, Ga, rcs, band, bwDeg, ha, targetHt, rainRate, ss, rainOn, clutterOn, techClass, rangeResOverride) => {
+  const lam = lamForBand(band);
+  const BW = 1 / 50e-6;
+  const noiseFloor = 1.38e-23 * 290 * BW * 10 ** (4 / 10) * 10 ** (6 / 10);
+  const SNRmin = 10 ** (13 / 10);
+  const hz = 2.2 * (Math.sqrt(ha) + Math.sqrt(targetHt));
+  const rNoise = (Pt * Ga * Ga * lam * lam * rcs / ((4 * Math.PI) ** 3 * noiseFloor * SNRmin)) ** 0.25;
+  const rNoiseNM = rNoise / 1852;
+  if (!rainOn && !clutterOn) return { effR: Math.min(rNoiseNM, hz), rNM: rNoiseNM, hz, rainLoss: 0, rainClutterDb: 0, cifDb: 0, limFactor: rNoiseNM > hz ? "horizon" : "power" };
+  let maxR = Math.min(rNoiseNM, hz);
+  const rainGamma = rainOn ? rainAtten(rainRate, band) : 0;
+  const rainEta = rainOn ? rainBackscatterEta(rainRate, band) : 0;
+  const rangeRes = rangeResOverride || clutterRangeRes(techClass);
+  const bwRad = bwDeg * Math.PI / 180;
+  const cifDb = clutterOn ? clutterCIF(techClass, band) : 0;
+  const cifLin = 10 ** (cifDb / 10);
+  for (let rNM = maxR; rNM > 0.3; rNM -= 0.05) {
+    const rKm = rNM * 1.852;
+    const rM = rNM * 1852;
+    const rainLossDb = rainOn ? 2 * rainGamma * rKm : 0;
+    const rainLossFactor = 10 ** (rainLossDb / 10);
+    const Pr = Pt * Ga * Ga * lam * lam * rcs / ((4 * Math.PI) ** 3 * rM ** 4);
+    const PrAfterRain = Pr / rainLossFactor;
+    const snr = PrAfterRain / noiseFloor;
+    if (snr < SNRmin) continue;
+    if (rainOn && rainRate > 0) {
+      const cellVol = rM * bwRad * bwRad * rangeRes;
+      const rainClutterRCS = rainEta * cellVol;
+      if (rainClutterRCS > 0) {
+        const scrRain = rcs / rainClutterRCS;
+        if (scrRain < SNRmin) continue;
+      }
+    }
+    if (clutterOn && ss > 0) {
+      const grazDeg = Math.atan2(ha, rM) * 180 / Math.PI;
+      const s0dB = seaClutterSigma0(ss, grazDeg, band);
+      const cellArea = rM * bwRad * rangeRes;
+      const rawClutterRCS = cellArea * 10 ** (s0dB / 10);
+      const effectiveClutterRCS = rawClutterRCS / cifLin;
+      const scr = rcs / Math.max(1e-10, effectiveClutterRCS);
+      if (scr < SNRmin) continue;
+    }
+    const totalRainLoss = rainOn ? 2 * rainGamma * rNM * 1.852 : 0;
+    const isHzLim = rNM >= hz - 0.05;
+    let detLimFactor = "power";
+    if (isHzLim) detLimFactor = "horizon";
+    else if (totalRainLoss > 3) detLimFactor = "rain";
+    else if (clutterOn && ss > 0) detLimFactor = "clutter+MTI";
+    return { effR: Math.min(rNM, hz), rNM: rNoiseNM, hz, rainLoss: totalRainLoss, rainClutterDb: rainOn ? 10 * Math.log10(Math.max(1e-20, rainEta)) : -999, cifDb, limFactor: detLimFactor };
+  }
+  return { effR: 0.3, rNM: rNoiseNM, hz, rainLoss: rainOn ? 2 * rainGamma * 0.3 * 1.852 : 0, rainClutterDb: -999, cifDb, limFactor: "env" };
+};
+
+const Hfn = (ha, ht) => 2.2 * (Math.sqrt(ha) + Math.sqrt(ht));
+const tHfn = (r) => r >= 1000 ? 8 : r >= 100 ? 5 : r >= 10 ? 3 : 1;
+const radE = (pw) => 2.2 * Math.sqrt(pw / 12000);
+const antHalfW = (ft) => (ft * 0.3048) / 2;
+const cantLenCalc = (pw, ft) => { const rr = radE(pw); const hw = antHalfW(ft); return Math.max(1.0, 0.8 + hw + rr + 0.5); };
+const scannerWt = (preset, ft, radars) => {
+  if (preset) { const r = (radars || DEFAULT_RADARS).find(x => x.id === preset); if (r) return r.wt; }
+  if (ft <= 6) return 33;
+  if (ft <= 6.5) return 33 + (ft - 6) * (61 - 33) / 0.5;
+  if (ft <= 8) return 61 + (ft - 6.5) * (80 - 61) / 1.5;
+  if (ft <= 12) return 80 + (ft - 8) * (150 - 80) / 4;
+  return 150 + (ft - 12) * (190 - 150) / 1;
+};
+const pedestalWt = (ft) => ft <= 8 ? 25 : ft <= 12 ? 35 : 45;
+const pedHt = (ft) => ft <= 6.5 ? 1.2 : ft <= 8 ? 1.6 : ft <= 12 ? 2.4 : 3.0;
+const pedWd = (ft) => ft <= 6.5 ? 0.35 : ft <= 8 ? 0.45 : ft <= 12 ? 0.6 : 0.7;
+const stBase = (ft) => {
+  const engPerPlat = 37500;
+  const xFab = 60000;
+  const sFab = 150000;
+  if (ft <= 8) return engPerPlat + xFab;
+  if (ft >= 12) return engPerPlat + sFab;
+  const frac = (ft - 8) / 4;
+  return engPerPlat + xFab + frac * (sFab - xFab);
+};
+const cantCost = (cl) => cl <= 1 ? 0 : (cl - 1) * 36000;
+const pwPrem = (pw) => pw <= 150 ? 0 : pw <= 250 ? 15000 : pw <= 400 ? 35000 : pw <= 600 ? 50000 : 75000;
+const closestV = (rcs) => { let b = VESSELS[0], d = Infinity; VESSELS.forEach(v => { const dd = Math.abs(Math.log10(v.rcs_x) - Math.log10(Math.max(1, rcs))); if (dd < d) { d = dd; b = v; } }); return b; };
+const unitCost = (preset, ft, pw, radars) => { if (preset) { const r = (radars || DEFAULT_RADARS).find(x => x.id === preset); if (r) return r.cost; } return ft <= 6.5 && pw <= 200 ? 33000 : ft <= 6.5 && pw <= 400 ? 55000 : ft <= 6.5 ? 85000 : ft <= 8 ? 95000 : ft <= 12 ? 94000 : 390000; };
+
+const SL = ({ label, value, min, max, step, onChange, fmt }) => (
+  <div style={{ marginBottom: 6 }}>
+    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 1 }}>
+      <span style={{ color: "var(--text-2)" }}>{label}</span>
+      <span style={{ fontWeight: 500, fontVariantNumeric: "tabular-nums", minWidth: 54, textAlign: "right" }}>{fmt ? fmt(value) : value}</span>
+    </div>
+    <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(+e.target.value)}
+      style={{ width: "100%", height: 3, appearance: "none", WebkitAppearance: "none", background: "var(--border)", borderRadius: 2, outline: "none", cursor: "pointer" }} />
+  </div>
+);
+
+const Tag = ({ ok, warn, children }) => (
+  <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: ok ? "var(--ok-bg)" : warn ? "var(--wn-bg)" : "var(--cr-bg)", color: ok ? "var(--ok)" : warn ? "var(--wn)" : "var(--cr)", marginLeft: 3, whiteSpace: "nowrap" }}>{children}</span>
+);
+
+const MC = ({ label, val, sub, ch }) => (
+  <div style={{ background: "var(--bg-2)", borderRadius: 6, padding: "4px 7px" }}>
+    <div style={{ fontSize: 9, color: "var(--text-2)" }}>{label}</div>
+    <div style={{ fontSize: 14, fontWeight: 500, fontVariantNumeric: "tabular-nums" }}>{val}</div>
+    {sub && <div style={{ fontSize: 9, color: "var(--text-2)" }}>{sub}{ch}</div>}
+  </div>
+);
+
+const CR = ({ l, v, c }) => (
+  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 2 }}>
+    <span style={{ color: "var(--text-2)" }}>{l}</span>
+    <span style={{ fontWeight: 500, color: c || "inherit", fontVariantNumeric: "tabular-nums" }}>{v}</span>
+  </div>
+);
+
+function TCPAChart({ effR, hz, rNM, sp }) {
+  const ref = useRef(null);
+  const cRef = useRef(null);
+  const tcpa = (effR / sp) * 60;
+  const xMax = Math.max(30, Math.ceil(Math.max(rNM, hz, effR) / 5) * 5 + 5);
+  const yMax = Math.max(120, Math.ceil(tcpa / 20) * 20 + 20);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (!window.Chart || !ref.current) return;
+      clearInterval(iv);
+      if (cRef.current) cRef.current.destroy();
+      cRef.current = new window.Chart(ref.current, {
+        type: "scatter",
+        data: { datasets: [
+          { label: "Op", data: [{ x: effR, y: tcpa }], backgroundColor: "#534AB7", borderColor: "#534AB7", pointRadius: 7, order: 0 },
+          { label: "Hz", data: [{ x: hz, y: 0 }, { x: hz, y: yMax }], borderColor: "#A32D2D", borderDash: [6, 3], pointRadius: 0, showLine: true, fill: false, borderWidth: 1.5, order: 2 },
+          { data: [{ x: 0, y: 60 }, { x: xMax, y: 60 }], borderColor: "#3266ad", borderDash: [4, 4], borderWidth: 1, pointRadius: 0, showLine: true, fill: false, order: 3 },
+          { data: [{ x: 0, y: 50 }, { x: xMax, y: 50 }], borderColor: "#639922", borderDash: [4, 4], borderWidth: 1, pointRadius: 0, showLine: true, fill: false, order: 3 },
+          { data: [{ x: 0, y: 25 }, { x: xMax, y: 25 }], borderColor: "#BA7517", borderDash: [4, 4], borderWidth: 1, pointRadius: 0, showLine: true, fill: false, order: 3 },
+          { data: [{ x: 0, y: 20 }, { x: xMax, y: 20 }], borderColor: "#A32D2D", borderDash: [4, 4], borderWidth: 1, pointRadius: 0, showLine: true, fill: false, order: 3 },
+          { label: "NL", data: [{ x: rNM, y: 0 }, { x: rNM, y: yMax }], borderColor: "#534AB7", borderDash: [2, 4], borderWidth: 1, pointRadius: 0, showLine: true, fill: false, order: 4 },
+        ] },
+        options: { responsive: true, maintainAspectRatio: false, animation: false,
+          scales: { x: { title: { display: true, text: "Range (NM)", font: { size: 10 } }, min: 0, max: xMax, grid: { color: "rgba(128,128,128,0.06)" } }, y: { title: { display: true, text: "TCPA (min)", font: { size: 10 } }, min: 0, max: yMax, grid: { color: "rgba(128,128,128,0.06)" } } },
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => c.datasetIndex === 0 ? `${c.parsed.x.toFixed(1)} NM / ${c.parsed.y.toFixed(1)} min` : "" } } } }
+      });
+    }, 50);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    if (!cRef.current) return;
+    cRef.current.data.datasets[0].data = [{ x: effR, y: tcpa }];
+    cRef.current.data.datasets[1].data = [{ x: hz, y: 0 }, { x: hz, y: yMax }];
+    [2, 3, 4, 5].forEach(i => {
+      const yVal = cRef.current.data.datasets[i].data[0].y;
+      cRef.current.data.datasets[i].data = [{ x: 0, y: yVal }, { x: xMax, y: yVal }];
+    });
+    cRef.current.data.datasets[6].data = [{ x: rNM, y: 0 }, { x: rNM, y: yMax }];
+    cRef.current.options.scales.x.max = xMax;
+    cRef.current.options.scales.y.max = yMax;
+    cRef.current.update("none");
+  }, [effR, hz, rNM, tcpa, xMax, yMax]);
+
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      <canvas ref={ref} />
+      <div style={{ position: "absolute", left: `${(effR / xMax) * 88 + 8}%`, top: `${(1 - tcpa / yMax) * 82 + 4}%`, transform: "translate(10px, -18px)", fontSize: 10, fontWeight: 500, color: "var(--text-1)", whiteSpace: "nowrap", pointerEvents: "none" }}>
+        {effR.toFixed(1)} NM / {tcpa.toFixed(0)} min
+      </div>
+      <div style={{ position: "absolute", left: `${(rNM / xMax) * 88 + 8}%`, top: "5%", transform: "translateX(8px)", fontSize: 9, color: "var(--text-1)", opacity: 0.8, whiteSpace: "nowrap", pointerEvents: "none", writingMode: "vertical-rl", letterSpacing: "1.5px" }}>
+        Noise {rNM.toFixed(1)} NM
+      </div>
+      <div style={{ position: "absolute", left: `${(hz / xMax) * 88 + 8}%`, top: "5%", transform: "translateX(8px)", fontSize: 9, color: "var(--text-1)", opacity: 0.8, whiteSpace: "nowrap", pointerEvents: "none", writingMode: "vertical-rl", letterSpacing: "1.5px" }}>
+        Horizon
+      </div>
+    </div>
+  );
+}
+
+function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes }) {
+  const cv = closestV(rcs);
+  const beamM = effR * 1852 * bw * Math.PI / 180;
+  const Ga = GfnBand(apt, band);
+  const det = useMemo(() => VESSELS.map(v => {
+    const env = effRangeWithEnv(pw, Ga, v.rcs_x, band, bw, ha, v.height, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes);
+    return { v, range: env.effR, hz: env.hz, limF: env.limFactor };
+  }), [pw, Ga, ha, band, bw, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes]);
+
+  const maxHz = Math.max(...det.map(d => d.hz));
+  const maxDet = Math.max(...det.map(d => d.range));
+  const maxR = Math.max(10, Math.ceil(Math.max(maxDet, maxHz / 0.95) / 5) * 5);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+      <div>
+        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }}>Vessel scale comparison <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
+        {VESSELS.map(v => {
+          const hit = v.type === cv.type;
+          const w = Math.max(6, (v.loa / 220) * 100);
+          return (
+            <div key={v.type} onClick={() => onSetRcs(v.rcs_x)} style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3, opacity: hit ? 1 : 0.5, cursor: "pointer", padding: "1px 3px", borderRadius: 4, background: hit ? "var(--bg-2)" : "transparent", transition: "all 0.12s" }}>
+              <div style={{ width: w, height: Math.max(3, (v.height / 18) * 11), background: v.color, borderRadius: 2, flexShrink: 0, border: hit ? `1.5px solid ${v.color}` : "none" }} />
+              <span style={{ fontSize: hit ? 10 : 9, fontWeight: hit ? 500 : 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.label}</span>
+              <span style={{ fontSize: 8, color: "var(--text-2)", marginLeft: "auto", whiteSpace: "nowrap" }}>{v.loa}m / {v.rcs_x.toLocaleString()}m²</span>
+            </div>
+          );
+        })}
+        <div style={{ marginTop: 6, background: "var(--bg-2)", borderRadius: 6, padding: "5px 8px", fontSize: 9 }}>
+          <div style={{ fontWeight: 500, marginBottom: 1 }}>{cv.label} (IALA T{cv.type})</div>
+          <div style={{ color: "var(--text-2)" }}>LOA {cv.loa}m | Beam {cv.beam}m | Ht {cv.height}m</div>
+          <div style={{ color: cv.loa < beamM ? "var(--ok)" : "var(--wn)", marginTop: 1 }}>
+            {cv.loa < beamM ? "Fits within" : "Exceeds"} beam ({cv.loa}m vs {beamM.toFixed(0)}m)
+          </div>
+        </div>
+      </div>
+      <div>
+        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }}>Detection range by type <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
+        {det.map((d, i) => {
+          const hit = d.v.type === cv.type;
+          const barW = Math.max(2, (d.range / maxR) * 100);
+          const hzW = Math.min(100, (d.hz / maxR) * 100);
+          const tc = d.v.rcs_x >= 1000 ? "#185FA5" : d.v.rcs_x >= 100 ? "#1D9E75" : "#BA7517";
+          return (
+            <div key={i} onClick={() => onSetRcs(d.v.rcs_x)} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 3, cursor: "pointer", padding: "1px 2px", borderRadius: 3, background: hit ? "var(--bg-2)" : "transparent", transition: "all 0.12s" }}>
+              <span style={{ fontSize: 8, color: "var(--text-2)", width: 14, textAlign: "right", flexShrink: 0 }}>T{d.v.type}</span>
+              <div style={{ flex: 1, position: "relative", height: 10 }}>
+                <div style={{ width: `${barW}%`, height: "100%", background: tc + (hit ? "77" : "44"), borderRadius: 2 }} />
+                <div style={{ position: "absolute", left: `${hzW}%`, top: -1, bottom: -1, borderLeft: "1px dashed #A32D2D" }} />
+                <span style={{ position: "absolute", left: `${hzW}%`, top: 0, marginLeft: 2, fontSize: 7, color: "var(--text-1)", whiteSpace: "nowrap", lineHeight: "10px" }}>{d.hz.toFixed(1)}</span>
+              </div>
+              <span style={{ fontSize: 8, fontWeight: hit ? 600 : 500, width: 36, fontVariantNumeric: "tabular-nums" }}>{d.range.toFixed(1)}</span>
+            </div>
+          );
+        })}
+        <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: 2 }}>Red dash = radar horizon | 0-{maxR} NM</div>
+        <div style={{ marginTop: 6, background: "var(--bg-2)", borderRadius: 6, padding: "5px 8px", fontSize: 9 }}>
+          <div style={{ fontWeight: 500, marginBottom: 1 }}>Beam footprint at {effR.toFixed(1)} NM</div>
+          <div style={{ color: "var(--text-2)" }}>Cross-range: {beamM.toFixed(0)}m ({(beamM / 1852).toFixed(2)} NM) at {bw.toFixed(2)}°</div>
+          <div style={{ color: "var(--text-2)" }}>Min sep: {beamM.toFixed(0)}m azimuth / 7.5m range</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radars_, limFactor }) {
+  const seaY = 280, ppm = Math.min((seaY - 40) / ha, 6), dkY = seaY - ha * ppm;
+  const rr = radE(pw), hwM = antHalfW(ft), cl = cantLenCalc(pw, ft), awm = ft * 0.3048;
+  const pedH = pedHt(ft);
+  const mpp = 3.5;
+  const clpx = cl * mpp;
+  const awpx = Math.max(4, awm * mpp);
+  const hwpx = awpx / 2;
+  const rrpx = rr * mpp;
+  const phx = Math.max(3, pedH * mpp);
+  const deckW = 30 * mpp;
+  const pX = 45;
+  const deckRight = pX + deckW;
+  const cx = pX + deckW / 2;
+  const lqW = 12 * mpp;
+  const lqH = 6 * mpp;
+  const lqY = dkY - lqH;
+  const heliW = 22 * mpp;
+  const heliH = Math.max(1.5, 0.3 * mpp);
+  const eqW = 8 * mpp;
+  const eqH = 4 * mpp;
+  const cantStartX = deckRight;
+  const atX = cantStartX + clpx;
+  const cantBaseY = dkY - 1;
+  const atY = cantBaseY - phx - 3;
+  const antH = Math.max(1.5, 0.15 * mpp);
+  const labelX = Math.max(atX + awpx / 2 + 10, atX + 14);
+  const cv = closestV(rcs);
+  const tcpa = (effR / sp) * 60;
+  const vesselFixedX = 470;
+  const loaScale = 0.4;
+  const shipLen = Math.max(8, cv.loa * loaScale);
+  const shipTotalH = cv.height * ppm;
+  const shipDraft = shipTotalH * 0.3;
+  const shipFreeboard = shipTotalH - shipDraft;
+  const hullTop = seaY - shipFreeboard;
+  const hullBot = seaY + shipDraft;
+  const sternX = vesselFixedX - shipLen / 2;
+  const bowX = vesselFixedX + shipLen / 2;
+  const dimY = seaY + 28;
+  const hzX = bowX + 30;
+
+  return (
+    <svg width="100%" viewBox="0 0 580 340" style={{ display: "block" }}>
+      <rect x="0" y="0" width="580" height={seaY} fill="var(--sky)" />
+      <rect x="0" y={seaY} width="580" height="60" fill="var(--sea)" />
+      <line x1="0" y1={seaY} x2="580" y2={seaY} stroke="var(--sea-line)" strokeWidth="0.7" />
+      <rect x={pX} y={dkY} width={deckW} height={Math.max(2, 0.5 * mpp)} rx="1.5" fill="var(--plat)" />
+      <line x1={pX + 2 * mpp} y1={dkY + 2} x2={pX + 0.5 * mpp} y2={seaY} stroke="var(--steel)" strokeWidth="2" />
+      <line x1={deckRight - 2 * mpp} y1={dkY + 2} x2={deckRight - 0.5 * mpp} y2={seaY} stroke="var(--steel)" strokeWidth="2" />
+      <line x1={cx} y1={dkY + 2} x2={cx} y2={seaY} stroke="var(--steel)" strokeWidth="1" />
+      <line x1={pX + 4 * mpp} y1={dkY + 2 + (seaY - dkY - 2) * 0.35} x2={deckRight - 4 * mpp} y2={dkY + 2 + (seaY - dkY - 2) * 0.35} stroke="var(--steel)" strokeWidth="0.6" />
+      <line x1={pX + 3 * mpp} y1={dkY + 2 + (seaY - dkY - 2) * 0.65} x2={deckRight - 3 * mpp} y2={dkY + 2 + (seaY - dkY - 2) * 0.65} stroke="var(--steel)" strokeWidth="0.6" />
+      {(() => {
+        const clampY = (y) => Math.max(4, y);
+        const lqYc = clampY(lqY);
+        const lqHc = Math.max(2, dkY - lqYc);
+        const heliYc = clampY(lqYc - 1.2 * mpp);
+        const eqYc = clampY(dkY - eqH);
+        return <>
+          <rect x={cx - lqW / 2} y={lqYc} width={lqW} height={lqHc} rx="1.5" fill="var(--plat)" opacity="0.6" />
+          {lqHc > 6 && <text x={cx} y={lqYc + lqHc / 2 + 1} textAnchor="middle" fontSize="6" fill="var(--text-2)" dominantBaseline="central">LQ</text>}
+          <rect x={cx + lqW / 2 + 0.5 * mpp} y={eqYc} width={eqW} height={Math.max(2, dkY - eqYc)} rx="1" fill="var(--plat)" opacity="0.4" />
+          <rect x={cx - heliW / 2} y={heliYc} width={heliW} height={heliH} rx="0.5" fill="var(--plat)" opacity="0.35" />
+          {heliYc > 8 && <text x={cx} y={heliYc - 2} textAnchor="middle" fontSize="5" fill="var(--text-2)">Helideck</text>}
+        </>;
+      })()}
+      <rect x={deckRight - 1 * mpp} y={dkY - Math.max(0.5, 0.1 * mpp)} width={1 * mpp} height={Math.max(0.5, 0.1 * mpp)} rx="0.3" fill="var(--plat)" opacity="0.5" />
+      {(() => {
+        const deckingH = Math.max(0.6, 0.05 * mpp);
+        const railH = Math.max(1.5, 1.0 * mpp);
+        return <>
+          <line x1={cantStartX} y1={cantBaseY} x2={atX} y2={cantBaseY} stroke="var(--steel)" strokeWidth="1.2" />
+          <rect x={cantStartX} y={cantBaseY - deckingH} width={clpx} height={deckingH} rx="0.3" fill="var(--steel)" opacity="0.3" />
+          <line x1={cantStartX} y1={cantBaseY - railH} x2={atX} y2={cantBaseY - railH} stroke="var(--steel)" strokeWidth="0.3" opacity="0.35" />
+          {Array.from({length: Math.max(2, Math.round(clpx / 8))}).map((_, i, a) => {
+            const sx = cantStartX + i * (clpx / (a.length - 1));
+            return <line key={`st${i}`} x1={sx} y1={cantBaseY} x2={sx} y2={cantBaseY - railH} stroke="var(--steel)" strokeWidth="0.3" opacity="0.3" />;
+          })}
+        </>;
+      })()}
+      <line x1={atX} y1={cantBaseY} x2={atX} y2={atY + 1.5} stroke="var(--steel)" strokeWidth="1.2" />
+      <rect x={atX - awpx / 2} y={atY} width={awpx} height={antH} rx="0.5" fill="var(--accent)" />
+      {rrpx > 0.5 && <>
+        <ellipse cx={atX - hwpx} cy={atY + antH / 2} rx={rrpx} ry={rrpx} fill="var(--rad-fill)" stroke="var(--rad-stroke)" strokeWidth="0.4" strokeDasharray="2 2" />
+        <ellipse cx={atX + hwpx} cy={atY + antH / 2} rx={rrpx} ry={rrpx} fill="var(--rad-fill)" stroke="var(--rad-stroke)" strokeWidth="0.4" strokeDasharray="2 2" />
+        {awpx > rrpx * 2 && <rect x={atX - hwpx} y={atY + antH / 2 - rrpx} width={awpx} height={rrpx * 2} fill="var(--rad-fill)" />}
+      </>}
+      {(() => {
+        const minLabelY = 12;
+        const radarLabelY = Math.max(minLabelY, atY - 22);
+        const radhazLabelY = Math.max(minLabelY + 12, atY - 10);
+        return <>
+          <line x1={atX} y1={atY} x2={labelX - 2} y2={radarLabelY + 2} stroke="var(--text-2)" strokeWidth="0.3" opacity="0.5" />
+          <text x={labelX} y={radarLabelY} fontSize="7" fill="var(--accent)" fontWeight="500">{ft.toFixed(1)}ft ({awm.toFixed(2)}m) / {Math.round(scannerWt(ap_, ft, radars_))}kg / {pw}W</text>
+          {rrpx > 0.5 && <>
+            <line x1={atX + hwpx + rrpx} y1={atY + antH / 2} x2={labelX - 2} y2={radhazLabelY + 2} stroke="var(--text-2)" strokeWidth="0.3" opacity="0.5" />
+            <text x={labelX} y={radhazLabelY} fontSize="6.5" fill="var(--cr)">{rr.toFixed(2)}m RADHAZ (from edge)</text>
+          </>}
+          {rrpx <= 0.5 && <text x={labelX} y={radhazLabelY} fontSize="6.5" fill="var(--ok)">{rr.toFixed(2)}m RADHAZ (negligible)</text>}
+        </>;
+      })()}
+      <line x1={cantStartX} y1={cantBaseY + 10} x2={atX} y2={cantBaseY + 10} stroke="var(--text-2)" strokeWidth="0.35" />
+      <line x1={cantStartX} y1={cantBaseY + 7} x2={cantStartX} y2={cantBaseY + 13} stroke="var(--text-2)" strokeWidth="0.35" />
+      <line x1={atX} y1={cantBaseY + 7} x2={atX} y2={cantBaseY + 13} stroke="var(--text-2)" strokeWidth="0.35" />
+      <text x={(cantStartX + atX) / 2} y={cantBaseY + 20} textAnchor="middle" fontSize="7" fill="var(--text-1)">{cl.toFixed(2)}m cantilever</text>
+      <text x={(cantStartX + atX) / 2} y={cantBaseY + 28} textAnchor="middle" fontSize="5.5" fill="var(--text-2)">0.8 walk + {hwM.toFixed(2)} half-ant + {rr.toFixed(2)} zone + 0.5 gap</text>
+      {cl > 1.2 && <>
+        <line x1={cantStartX + 0.8 * mpp} y1={cantBaseY - 2} x2={cantStartX + 0.8 * mpp} y2={cantBaseY + 2} stroke="var(--text-2)" strokeWidth="0.3" opacity="0.4" />
+        <line x1={atX - hwpx - rrpx} y1={cantBaseY - 2} x2={atX - hwpx - rrpx} y2={cantBaseY + 2} stroke="var(--rad-stroke)" strokeWidth="0.3" opacity="0.5" />
+        <line x1={atX - hwpx} y1={cantBaseY - 2} x2={atX - hwpx} y2={cantBaseY + 2} stroke="var(--accent)" strokeWidth="0.3" opacity="0.5" />
+        <line x1={atX + hwpx} y1={cantBaseY - 2} x2={atX + hwpx} y2={cantBaseY + 2} stroke="var(--accent)" strokeWidth="0.3" opacity="0.5" />
+      </>}
+      <line x1="20" y1={dkY} x2="20" y2={seaY} stroke="var(--text-2)" strokeWidth="0.4" />
+      <line x1="16" y1={dkY} x2="24" y2={dkY} stroke="var(--text-2)" strokeWidth="0.4" />
+      <line x1="16" y1={seaY} x2="24" y2={seaY} stroke="var(--text-2)" strokeWidth="0.4" />
+      <text x="17" y={(dkY + seaY) / 2} textAnchor="middle" fontSize="7" fill="var(--text-1)" transform={`rotate(-90,17,${(dkY + seaY) / 2})`}>{ha.toFixed(1)}m ASL</text>
+      {(() => {
+        const midY = seaY / 2;
+        return <>
+          <line x1={hzX} y1={20} x2={hzX} y2={seaY + 6} stroke="var(--cr)" strokeWidth="1.2" strokeDasharray="5 3" opacity="0.55" />
+          <rect x={hzX - 24} y={midY - 5} width="48" height="10" rx="3" fill="var(--cr-bg)" />
+          <text x={hzX} y={midY + 2.5} textAnchor="middle" fontSize="6.5" fill="var(--cr)" fontWeight="500">Horizon {hz.toFixed(1)} NM</text>
+        </>;
+      })()}
+      <line x1={atX} y1={atY + antH / 2} x2={vesselFixedX} y2={hullTop} stroke="var(--accent)" strokeWidth="0.6" strokeDasharray="4 3" opacity="0.4" />
+      {(() => {
+        const fb = shipFreeboard;
+        const dr = shipDraft;
+        const L = shipLen;
+        const wl = seaY;
+        const dkV = wl - fb;
+        const bowRise = fb * 0.35;
+        const sternRise = fb * 0.1;
+        const bowRake = L * 0.05;
+        const hull = `M ${sternX},${dkV - sternRise} Q ${sternX + L * 0.03},${dkV} ${sternX + L * 0.06},${dkV} L ${bowX - L * 0.12},${dkV} Q ${bowX - L * 0.05},${dkV} ${bowX},${dkV - bowRise} L ${bowX + bowRake},${dkV - bowRise - fb * 0.08} Q ${bowX + bowRake * 0.8},${wl - fb * 0.1} ${bowX + bowRake * 0.3},${wl} L ${bowX - L * 0.02},${wl + dr * 0.4} Q ${bowX - L * 0.08},${wl + dr} ${vesselFixedX},${wl + dr} Q ${sternX + L * 0.1},${wl + dr} ${sternX + L * 0.02},${wl + dr * 0.6} Q ${sternX - L * 0.01},${wl + dr * 0.15} ${sternX - L * 0.02},${wl} Q ${sternX - L * 0.02},${wl - fb * 0.05} ${sternX},${dkV - sternRise} Z`;
+        const ssStart = sternX + L * 0.06;
+        const ssEnd = sternX + L * 0.3;
+        const ssW = ssEnd - ssStart;
+        const deck1H = fb * 0.25;
+        const deck2H = fb * 0.2;
+        const bridgeH = fb * 0.3;
+        const deck1Top = dkV - deck1H;
+        const deck2Top = deck1Top - deck2H;
+        const bridgeTop = deck2Top - bridgeH;
+        const funnelCx = ssStart + ssW * 0.6;
+        const funnelW = Math.max(2, ssW * 0.18);
+        const funnelH = fb * 0.35;
+        const mastX_ = ssStart + ssW * 0.3;
+        const mastTop_ = bridgeTop - fb * 0.4;
+        const fwdMastX_ = sternX + L * 0.55;
+        const fwdMastTop_ = dkV - fb * 0.55;
+        const holdStart = ssEnd + L * 0.03;
+        const holdEnd = bowX - L * 0.15;
+        const holdH = fb * 0.15;
+        const nHolds = cv.loa > 60 ? (cv.loa > 120 ? 4 : 3) : (cv.loa > 30 ? 2 : 0);
+        const holdGap = nHolds > 0 ? (holdEnd - holdStart) / nHolds : 0;
+        return <>
+          <path d={hull} fill={cv.color} opacity="0.5" stroke={cv.color} strokeWidth="0.5" strokeLinejoin="round" />
+          <line x1={sternX - L * 0.02} y1={wl} x2={bowX + bowRake * 0.3} y2={wl} stroke={cv.color} strokeWidth="0.6" opacity="0.6" />
+          <line x1={sternX + L * 0.06} y1={dkV} x2={bowX - L * 0.12} y2={dkV} stroke={cv.color} strokeWidth="0.3" opacity="0.35" />
+          <rect x={ssStart} y={deck1Top} width={ssW} height={deck1H} rx="0.6" fill={cv.color} opacity="0.65" />
+          {L > 18 && Array.from({length: Math.min(5, Math.max(2, Math.floor(ssW / 3.5)))}).map((_, i, a) => (
+            <circle key={`p${i}`} cx={ssStart + ssW * 0.1 + i * (ssW * 0.8) / (a.length - 1 || 1)} cy={deck1Top + deck1H * 0.5} r={0.5} fill="var(--sky)" opacity="0.25" />
+          ))}
+          <rect x={ssStart + ssW * 0.06} y={deck2Top} width={ssW * 0.88} height={deck2H} rx="0.6" fill={cv.color} opacity="0.7" />
+          <rect x={ssStart + ssW * 0.12} y={bridgeTop} width={ssW * 0.72} height={bridgeH} rx="0.6" fill={cv.color} opacity="0.8" />
+          <rect x={ssStart + ssW * 0.15} y={bridgeTop + Math.max(0.8, bridgeH * 0.1)} width={ssW * 0.66} height={Math.max(1, bridgeH * 0.2)} rx="0.3" fill="var(--sky)" opacity="0.45" />
+          {L > 15 && <>
+            <line x1={ssStart + ssW * 0.12} y1={bridgeTop + bridgeH * 0.5} x2={ssStart - L * 0.008} y2={bridgeTop + bridgeH * 0.5} stroke={cv.color} strokeWidth="0.4" opacity="0.5" />
+            <line x1={ssStart + ssW * 0.84} y1={bridgeTop + bridgeH * 0.5} x2={ssEnd + L * 0.008} y2={bridgeTop + bridgeH * 0.5} stroke={cv.color} strokeWidth="0.4" opacity="0.5" />
+          </>}
+          {L > 12 && <>
+            <rect x={funnelCx - funnelW / 2} y={bridgeTop - funnelH} width={funnelW} height={funnelH} rx="0.5" fill={cv.color} opacity="0.7" />
+            <rect x={funnelCx - funnelW * 0.65 / 2} y={bridgeTop - funnelH - 0.4} width={funnelW * 0.65} height={0.6} rx="0.2" fill={cv.color} opacity="0.4" />
+          </>}
+          <line x1={mastX_} y1={bridgeTop} x2={mastX_} y2={mastTop_} stroke={cv.color} strokeWidth="0.5" />
+          <line x1={mastX_ - L * 0.012} y1={mastTop_ + 0.4} x2={mastX_ + L * 0.012} y2={mastTop_ + 0.4} stroke={cv.color} strokeWidth="0.4" />
+          {L > 22 && <>
+            <line x1={fwdMastX_} y1={dkV} x2={fwdMastX_} y2={fwdMastTop_} stroke={cv.color} strokeWidth="0.4" />
+            <line x1={fwdMastX_ - L * 0.01} y1={fwdMastTop_ + 0.4} x2={fwdMastX_ + L * 0.01} y2={fwdMastTop_ + 0.4} stroke={cv.color} strokeWidth="0.3" />
+          </>}
+          {nHolds > 0 && Array.from({length: nHolds}).map((_, i) => (
+            <rect key={`h${i}`} x={holdStart + i * holdGap + holdGap * 0.1} y={dkV - holdH} width={holdGap * 0.78} height={holdH} rx="0.3" fill={cv.color} opacity="0.28" />
+          ))}
+          <path d={`M ${bowX + bowRake * 0.3 + 0.5},${wl - 0.3} Q ${bowX + bowRake + L * 0.03},${wl - 1.2} ${bowX + bowRake + L * 0.06},${wl}`} fill="none" stroke="var(--sea-line)" strokeWidth="0.4" opacity="0.3" />
+        </>;
+      })()}
+      {(() => {
+        const fb = shipFreeboard;
+        const dkV = seaY - fb;
+        const bridgeTopA = dkV - fb * 0.25 - fb * 0.2 - fb * 0.3;
+        const topFeature = Math.min(bridgeTopA - fb * 0.4, bridgeTopA - fb * 0.35);
+        return <>
+          <text x={vesselFixedX} y={topFeature - 5} textAnchor="middle" fontSize="7" fill="var(--text-1)" fontWeight="500">{cv.label}</text>
+          <text x={vesselFixedX} y={topFeature + 1} textAnchor="middle" fontSize="6" fill="var(--text-2)">LOA {cv.loa}m | Ht {cv.height}m | RCS {cv.rcs_x.toLocaleString()}m² | T{cv.type}</text>
+        </>;
+      })()}
+      <line x1={atX} y1={dimY} x2={hzX} y2={dimY} stroke="var(--accent)" strokeWidth="0.5" />
+      <line x1={atX} y1={dimY - 3} x2={atX} y2={dimY + 3} stroke="var(--accent)" strokeWidth="0.5" />
+      <line x1={hzX} y1={dimY - 3} x2={hzX} y2={dimY + 3} stroke="var(--accent)" strokeWidth="0.5" />
+      <rect x={(atX + hzX) / 2 - 50} y={dimY - 5.5} width="100" height="11" rx="3" fill="var(--bg-2)" />
+      <text x={(atX + hzX) / 2} y={dimY + 2} textAnchor="middle" fontSize="7" fill="var(--accent)" fontWeight="500">{effR.toFixed(1)} NM detection ({limFactor}-lim)</text>
+      <rect x={(atX + hzX) / 2 - 40} y={dimY + 6.5} width="80" height="10" rx="3" fill={tcpa >= 50 ? "var(--ok-bg)" : tcpa >= 25 ? "var(--wn-bg)" : "var(--cr-bg)"} />
+      <text x={(atX + hzX) / 2} y={dimY + 14} textAnchor="middle" fontSize="6.5" fill={tcpa >= 50 ? "var(--ok)" : tcpa >= 25 ? "var(--wn)" : "var(--cr)"} fontWeight="500">{tcpa.toFixed(1)} min TCPA at {sp} kn</text>
+    </svg>
+  );
+}
+
+function App() {
+  const [pw, setPw] = useState(110);
+  const [apt, setApt] = useState(6);
+  const [ha, setHa] = useState(23.5);
+  const [bw, setBw] = useState(1.32);
+  const [rcs, setRcs] = useState(1000);
+  const [sp, setSp] = useState(17);
+  const [ap, setAp] = useState("path16");
+  const [band, setBand] = useState("X");
+  const [radars, setRadars] = useState(DEFAULT_RADARS);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newR, setNewR] = useState({ name: "", band: "X", pw: 100, apt: 6, bw: 1.3, wt: 30, cost: 30000, iec: "None", wind: 100, tech: "", techClass: "ss_doppler" });
+  const [rainOn, setRainOn] = useState(false);
+  const [rainRate, setRainRate] = useState(34.7);
+  const [clutterOn, setClutterOn] = useState(false);
+  const [seaState, setSeaState] = useState(4);
+
+  const selP = useCallback((id) => {
+    const r = radars.find(x => x.id === id); if (!r) return;
+    setAp(id); setPw(Math.min(2000, r.pw)); setApt(r.apt); if (r.bw) setBw(r.bw); setBand(r.band || "X");
+  }, [radars]);
+  const clrP = useCallback(() => setAp(null), []);
+
+  const Ga = GfnBand(apt, band);
+  const ht = tHfn(rcs);
+  const techClass = ap ? (radars.find(r => r.id === ap)?.techClass || "ss_doppler") : "ss_doppler";
+  const presetRangeRes = ap ? (radars.find(r => r.id === ap)?.rangeRes || null) : null;
+  const env = effRangeWithEnv(pw, Ga, rcs, band, bw, ha, ht, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes);
+  const { effR, rNM, hz, rainLoss, cifDb, limFactor } = env;
+  const tcpa = (effR / sp) * 60;
+  const beamM = effR * 1852 * bw * Math.PI / 180;
+  const rR = radE(pw), hw = antHalfW(apt), cL = cantLenCalc(pw, apt);
+  const sb = stBase(apt), cc = cantCost(cL), rc = unitCost(ap, apt, pw, radars), pp = pwPrem(pw), per = sb + cc + rc + pp;
+  const cantSteelW = Math.round(cL * 18);
+  const cantDeckW = Math.round(cL * 20);
+  const cantW = cantSteelW + cantDeckW;
+  const scanW = Math.round(scannerWt(ap, apt, radars)), pedW_ = pedestalWt(apt), totW = scanW + pedW_ + cantW;
+  const preset = ap ? radars.find(r => r.id === ap) : null;
+
+  const css = `
+    :root {
+      --bg-1: #ffffff; --bg-2: #f5f5f0; --text-1: #1a1a18; --text-2: #8a8a86; --border: #e0dfda;
+      --accent: #534AB7; --accent-bg: #EEEDFE; --accent-text: #3C3489;
+      --ok: #0a6847; --ok-bg: #e0f2e9; --wn: #7a5a00; --wn-bg: #fef3cd; --cr: #A32D2D; --cr-bg: #fce8e8;
+      --sky: #e6f1fb; --sea: #b5d4f4; --sea-line: #85B7EB; --steel: #5F5E5A; --plat: #B4B2A9;
+      --rad-fill: rgba(227,75,74,0.12); --rad-stroke: rgba(163,45,45,0.35);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-1: #1a1a1a; --bg-2: #2C2C2A; --text-1: #e0ddd5; --text-2: #9c9a92; --border: #444441;
+        --accent: #AFA9EC; --accent-bg: #26215C; --accent-text: #CECBF6;
+        --ok: #5DCAA5; --ok-bg: #04342C; --wn: #FAC775; --wn-bg: #412402; --cr: #F09595; --cr-bg: #501313;
+        --sky: #0d1b2a; --sea: #1a3a50; --sea-line: #3a6a8a; --steel: #888780; --plat: #444441;
+        --rad-fill: rgba(227,75,74,0.18); --rad-stroke: rgba(227,75,74,0.5);
+      }
+    }
+  `;
+
+  return (
+    <>
+      <style>{css}</style>
+      <div style={{ display: "grid", gridTemplateColumns: "228px 1fr", height: "100vh", fontFamily: "system-ui, -apple-system, sans-serif", fontSize: 12, color: "var(--text-1)", overflow: "hidden", background: "var(--bg-1)" }}>
+
+        <div style={{ borderRight: `0.5px solid var(--border)`, padding: "10px 11px", overflowY: "auto", background: "var(--bg-2)" }}>
+          <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8, letterSpacing: "-0.02em" }}>CARS radar explorer</div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+            <span style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Model presets</span>
+            <button onClick={() => setShowAdd(!showAdd)} style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, border: "0.5px solid var(--border)", background: showAdd ? "var(--accent-bg)" : "var(--bg-1)", color: showAdd ? "var(--accent-text)" : "var(--text-2)", cursor: "pointer" }}>{showAdd ? "Cancel" : "+ Add"}</button>
+          </div>
+
+          {showAdd && (
+            <div style={{ background: "var(--bg-1)", border: "0.5px solid var(--border)", borderRadius: 6, padding: 7, marginBottom: 6, fontSize: 9 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 4 }}>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Name *</div>
+                  <input value={newR.name} onChange={e => setNewR({ ...newR, name: e.target.value })} placeholder="e.g. FAR-2127" style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Band</div>
+                  <select value={newR.band} onChange={e => setNewR({ ...newR, band: e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 2px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }}>
+                    <option value="X">X-Band</option><option value="S">S-Band</option>
+                  </select>
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Power (W)</div>
+                  <input type="number" value={newR.pw} onChange={e => setNewR({ ...newR, pw: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Aperture (ft)</div>
+                  <input type="number" value={newR.apt} step="0.5" onChange={e => setNewR({ ...newR, apt: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Beamwidth (°)</div>
+                  <input type="number" value={newR.bw} step="0.01" onChange={e => setNewR({ ...newR, bw: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Weight (kg)</div>
+                  <input type="number" value={newR.wt} onChange={e => setNewR({ ...newR, wt: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Cost ($)</div>
+                  <input type="number" value={newR.cost} step="1000" onChange={e => setNewR({ ...newR, cost: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Wind (kn)</div>
+                  <input type="number" value={newR.wind} onChange={e => setNewR({ ...newR, wind: +e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>IEC class</div>
+                  <select value={newR.iec} onChange={e => setNewR({ ...newR, iec: e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 2px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }}>
+                    <option value="None">None</option><option value="CAT 3">CAT 3</option><option value="CAT 2">CAT 2</option><option value="CAT 1">CAT 1</option><option value="VTS">VTS</option>
+                  </select>
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Tech</div>
+                  <input value={newR.tech} onChange={e => setNewR({ ...newR, tech: e.target.value })} placeholder="e.g. SS FMCW" style={{ width: "100%", fontSize: 9, padding: "2px 4px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 1 }}>Processing</div>
+                  <select value={newR.techClass} onChange={e => setNewR({ ...newR, techClass: e.target.value })} style={{ width: "100%", fontSize: 9, padding: "2px 2px", border: "0.5px solid var(--border)", borderRadius: 3, background: "var(--bg-2)", color: "var(--text-1)" }}>
+                    <option value="magnetron">Magnetron</option>
+                    <option value="ss_doppler">SS Doppler</option>
+                    <option value="ss_pulsecomp">SS pulse comp</option>
+                    <option value="ss_coherent">SS coherent</option>
+                  </select>
+                </div>
+              </div>
+              <button disabled={!newR.name.trim()} onClick={() => {
+                const id = "custom_" + Date.now();
+                const entry = { ...newR, id, rec: false, custom: true };
+                setRadars(prev => [...prev, entry]);
+                setAp(id);
+                setPw(Math.min(2000, entry.pw));
+                setApt(entry.apt);
+                setBw(entry.bw);
+                setBand(entry.band || "X");
+                setShowAdd(false);
+                setNewR({ name: "", band: "X", pw: 100, apt: 6, bw: 1.3, wt: 30, cost: 30000, iec: "None", wind: 100, tech: "", techClass: "ss_doppler" });
+              }} style={{ width: "100%", padding: "3px 0", borderRadius: 4, border: "none", background: newR.name.trim() ? "var(--accent)" : "var(--border)", color: newR.name.trim() ? "#fff" : "var(--text-2)", cursor: newR.name.trim() ? "pointer" : "default", fontSize: 9, fontWeight: 500 }}>
+                Add radar preset
+              </button>
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 8 }}>
+            {radars.map(r => (
+              <button key={r.id} onClick={() => selP(r.id)} style={{ padding: "3px 6px", borderRadius: 5, border: ap === r.id ? "1.5px solid var(--accent)" : "0.5px solid var(--border)", background: ap === r.id ? "var(--accent-bg)" : "var(--bg-1)", cursor: "pointer", fontSize: 9, color: ap === r.id ? "var(--accent-text)" : "var(--text-2)", textAlign: "left", lineHeight: 1.2, position: "relative" }}>
+                <div style={{ fontWeight: 500, color: ap === r.id ? "var(--accent-text)" : "var(--text-1)" }}>{r.name}</div>
+                <div style={{ fontSize: 8, opacity: 0.6 }}>{r.band} {r.pw}W {r.apt}ft</div>
+                <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
+                  {r.rec && <Tag ok>Rec</Tag>}
+                  {r.custom && <Tag warn>Custom</Tag>}
+                  {r.wind && r.wind < 100 && <Tag>70kn</Tag>}
+                  {r.iec === "None" && <Tag warn>No IEC</Tag>}
+                  {r.band === "S" && <Tag warn>S</Tag>}
+                </div>
+                {r.custom && (
+                  <span onClick={e => { e.stopPropagation(); if (ap === r.id) setAp(null); setRadars(radars.filter(x => x.id !== r.id)); }} style={{ position: "absolute", top: 1, right: 2, fontSize: 9, color: "var(--cr)", cursor: "pointer", lineHeight: 1, opacity: 0.6 }} title="Remove">×</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Parameters</div>
+          <SL label="Peak power" value={pw} min={50} max={2000} step={10} onChange={v => { clrP(); setPw(v); }} fmt={v => `${v} W`} />
+          <SL label="Aperture" value={apt} min={4} max={14} step={0.5} onChange={v => { clrP(); setApt(v); }} fmt={v => `${v.toFixed(1)} ft`} />
+          <SL label="Height ASL" value={ha} min={15} max={100} step={0.5} onChange={v => setHa(v)} fmt={v => `${v.toFixed(1)} m`} />
+          <SL label="Beamwidth" value={bw} min={0.8} max={2.5} step={0.01} onChange={v => { clrP(); setBw(v); }} fmt={v => `${v.toFixed(2)}°`} />
+          <SL label="Target RCS" value={rcs} min={1} max={10000} step={1} onChange={v => setRcs(v)} fmt={v => `${v.toLocaleString()} m²`} />
+          <SL label="Speed" value={sp} min={5} max={30} step={1} onChange={v => setSp(v)} fmt={v => `${v} kn`} />
+
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Band</div>
+            <div style={{ display: "flex", gap: 3, marginBottom: 6 }}>
+              {["X", "S"].map(b => (
+                <button key={b} onClick={() => { clrP(); setBand(b); }} style={{ flex: 1, padding: "3px 0", borderRadius: 4, border: band === b ? "1.5px solid var(--accent)" : "0.5px solid var(--border)", background: band === b ? "var(--accent-bg)" : "var(--bg-1)", color: band === b ? "var(--accent-text)" : "var(--text-2)", cursor: "pointer", fontSize: 9, fontWeight: 500 }}>
+                  {b}-Band ({b === "X" ? "9.4 GHz" : "3.05 GHz"})
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Environment</div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+              <button onClick={() => setRainOn(!rainOn)} style={{ width: 28, height: 14, borderRadius: 7, border: "none", background: rainOn ? "var(--accent)" : "var(--border)", cursor: "pointer", position: "relative", transition: "background 0.15s" }}>
+                <div style={{ width: 10, height: 10, borderRadius: 5, background: "#fff", position: "absolute", top: 2, left: rainOn ? 16 : 2, transition: "left 0.15s" }} />
+              </button>
+              <span style={{ fontSize: 10, color: rainOn ? "var(--text-1)" : "var(--text-2)" }}>Rain attenuation</span>
+            </div>
+            {rainOn && (
+              <div style={{ marginBottom: 6, paddingLeft: 33 }}>
+                <SL label="Rain rate" value={rainRate} min={0} max={100} step={0.5} onChange={v => setRainRate(v)} fmt={v => `${v.toFixed(1)} mm/hr`} />
+                <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: -3 }}>
+                  Path atten: {rainAtten(rainRate, band).toFixed(3)} dB/km ({band}-Band) | {rainOn && effR > 0 ? `${rainLoss.toFixed(1)} dB two-way` : "off"}
+                </div>
+                <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: 1 }}>
+                  Rain backscatter (volume clutter) also modelled
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+              <button onClick={() => setClutterOn(!clutterOn)} style={{ width: 28, height: 14, borderRadius: 7, border: "none", background: clutterOn ? "var(--accent)" : "var(--border)", cursor: "pointer", position: "relative", transition: "background 0.15s" }}>
+                <div style={{ width: 10, height: 10, borderRadius: 5, background: "#fff", position: "absolute", top: 2, left: clutterOn ? 16 : 2, transition: "left 0.15s" }} />
+              </button>
+              <span style={{ fontSize: 10, color: clutterOn ? "var(--text-1)" : "var(--text-2)" }}>Sea clutter</span>
+            </div>
+            {clutterOn && (
+              <div style={{ marginBottom: 6, paddingLeft: 33 }}>
+                <SL label="Sea state" value={seaState} min={0} max={6} step={1} onChange={v => setSeaState(v)} fmt={v => `SS${v}`} />
+                <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: -3 }}>
+                  {seaState === 0 ? "Calm (glassy)" : seaState <= 2 ? "Slight" : seaState <= 4 ? "Moderate" : "Rough"} | {clutterLabel(techClass)}: CIF {clutterCIF(techClass, band)} dB{band === "S" ? " (inc. +3 dB S-Band)" : ""}
+                </div>
+              </div>
+            )}
+
+            {(rainOn || clutterOn) && (
+              <div style={{ background: "var(--wn-bg)", borderRadius: 4, padding: "4px 6px", marginTop: 4, fontSize: 8, color: "var(--wn)", lineHeight: 1.3 }}>
+                Indicative only. Environmental effects are first-order estimates for comparative trade studies. Not suitable for operational detection prediction. Vendor simulation (Action TV-01) required for Gate 3 validation. Does not model atmospheric ducting, target fluctuation (Swerling), multipath, or scan integration.
+              </div>
+            )}
+          </div>
+
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Key metrics</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+              <MC label="Eff. range" val={`${effR.toFixed(1)} NM`} sub={`${limFactor}-lim`} />
+              <MC label="TCPA" val={`${tcpa.toFixed(1)} min`} sub={`${sp} kn`} ch={<Tag ok={tcpa >= 50} warn={tcpa >= 25 && tcpa < 50}>{tcpa >= 50 ? "ERM ok" : tcpa >= 25 ? "<50" : "Crit"}</Tag>} />
+              <MC label="Beam" val={`${beamM.toFixed(0)} m`} sub={`${effR.toFixed(1)} NM`} ch={<Tag ok={bw <= 1.4} warn={bw > 1.4}>BW-01</Tag>} />
+              <MC label="Per pos." val={`$${(per / 1000).toFixed(0)}k`} sub={`5p $${(per * 5 / 1000).toFixed(0)}k`} />
+            </div>
+          </div>
+
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Cost / position</div>
+            <CR l="Radar unit" v={`$${(rc / 1000).toFixed(0)}k`} c="var(--accent)" />
+            {preset && <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 3, marginTop: -1 }}>{preset.name} (ex GST)</div>}
+            {!preset && <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 3, marginTop: -1 }}>Est. from parameters</div>}
+            <CR l="Steel (eng. + fab.)" v={`$${(sb / 1000).toFixed(0)}k`} />
+            <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 2, marginTop: -1 }}>Eng $38k + Fab ${((sb - 37500) / 1000).toFixed(0)}k</div>
+            <CR l="Cant. premium" v={`+$${(cc / 1000).toFixed(0)}k`} c={cc > 0 ? "var(--cr)" : undefined} />
+            <CR l="Power infra." v={`$${(pp / 1000).toFixed(0)}k`} c={pp > 0 ? "var(--wn)" : undefined} />
+            <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 3, paddingTop: 3 }}>
+              <CR l="Per position" v={`$${(per / 1000).toFixed(0)}k`} c="var(--accent)" />
+              <CR l="5-pos network" v={`$${(per * 5 / 1000).toFixed(0)}k`} c="var(--accent)" />
+            </div>
+            <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: 2 }}>All estimates ±30%</div>
+          </div>
+
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Installation</div>
+            <CR l="Scanner weight" v={`${scanW} kg`} />
+            <CR l="Pedestal/mount" v={`${pedW_} kg`} />
+            <CR l="Cant. steel" v={`~${cantSteelW} kg`} />
+            <CR l="Cant. decking" v={`~${cantDeckW} kg`} />
+            <CR l="Total weight" v={`~${totW} kg`} />
+            <CR l="RADHAZ (edge)" v={`${rR.toFixed(2)} m`} c={rR < 0.3 ? "var(--ok)" : rR < 1 ? "var(--wn)" : "var(--cr)"} />
+            <CR l="Ant. half-width" v={`${hw.toFixed(2)} m`} />
+            <CR l="Cantilever" v={`${cL.toFixed(2)} m`} />
+            <CR l="Pedestal" v={`${pedHt(apt).toFixed(1)}m x ${pedWd(apt).toFixed(2)}m`} />
+            {preset && <CR l="IEC 62388" v={preset.iec} />}
+            {preset && <CR l="Wind" v={preset.wind ? `${preset.wind} kn` : "N/P"} c={preset.wind && preset.wind < 100 ? "var(--cr)" : undefined} />}
+          </div>
+        </div>
+
+        <div style={{ overflowY: "auto", padding: "10px 14px" }}>
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }}>Detection range vs TCPA</div>
+          <div style={{ height: 200, marginBottom: 4 }}>
+            <TCPAChart effR={effR} hz={hz} rNM={rNM} sp={sp} />
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12, fontSize: 8, color: "var(--text-2)", flexWrap: "wrap" }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: "#534AB7", display: "inline-block" }} />Op. point</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 10, borderTop: "1.5px dashed #A32D2D", display: "inline-block" }} />Horizon</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 10, borderTop: "1px dashed #639922", display: "inline-block" }} />50 min</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 10, borderTop: "1px dashed #BA7517", display: "inline-block" }} />25 min</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 10, borderTop: "1px dashed #534AB7", display: "inline-block" }} />Noise-lim</span>
+          </div>
+
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }}>Target vessel profile and beam resolution</div>
+          <VesselPanel rcs={rcs} bw={bw} effR={effR} pw={pw} ha={ha} apt={apt} onSetRcs={setRcs} band={band} rainRate={rainRate} seaState={seaState} rainOn={rainOn} clutterOn={clutterOn} techClass={techClass} presetRangeRes={presetRangeRes} />
+
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginTop: 12, marginBottom: 3 }}>Platform installation geometry</div>
+          <PlatformSVG ha={ha} ft={apt} pw={pw} effR={effR} hz={hz} rcs={rcs} sp={sp} preset={ap} radars={radars} limFactor={limFactor} />
+
+          <div style={{ marginTop: 6, fontSize: 8, color: "var(--text-2)", lineHeight: 1.4 }}>
+            {band}-Band {(freqForBand(band) / 1e9).toFixed(2)} GHz | {clutterLabel(techClass)} | Beam: {beamM.toFixed(0)}m at {effR.toFixed(1)} NM | Lim: {limFactor}{rainOn ? ` | Rain: ${rainRate} mm/hr (${rainAtten(rainRate, band).toFixed(3)} dB/km path + backscatter)` : ""}{clutterOn ? ` | Clutter: SS${seaState}, CIF ${cifDb} dB` : ""} | All +/-30%{(rainOn || clutterOn) ? " | Env. effects indicative only (ref. ITU-R P.838-3, Nathanson)" : ""}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+</body>
+</html>
