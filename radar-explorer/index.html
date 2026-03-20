@@ -241,10 +241,10 @@ const pwPrem = (pw) => pw <= 150 ? 0 : pw <= 250 ? 15000 : pw <= 400 ? 35000 : p
 const closestV = (rcs) => { let b = VESSELS[0], d = Infinity; VESSELS.forEach(v => { const dd = Math.abs(Math.log10(v.rcs_x) - Math.log10(Math.max(1, rcs))); if (dd < d) { d = dd; b = v; } }); return b; };
 const unitCost = (preset, ft, pw, radars) => { if (preset) { const r = (radars || DEFAULT_RADARS).find(x => x.id === preset); if (r) return r.cost; } return ft <= 6.5 && pw <= 200 ? 33000 : ft <= 6.5 && pw <= 400 ? 55000 : ft <= 6.5 ? 85000 : ft <= 8 ? 95000 : ft <= 12 ? 94000 : 390000; };
 
-const SL = ({ label, value, min, max, step, onChange, fmt }) => (
-  <div style={{ marginBottom: 6 }}>
+const SL = ({ label, value, min, max, step, onChange, fmt, tip }) => (
+  <div style={{ marginBottom: 6 }} title={tip}>
     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 1 }}>
-      <span style={{ color: "var(--text-2)" }}>{label}</span>
+      <span style={{ color: "var(--text-2)", cursor: tip ? "help" : "default" }}>{label}</span>
       <span style={{ fontWeight: 500, fontVariantNumeric: "tabular-nums", minWidth: 54, textAlign: "right" }}>{fmt ? fmt(value) : value}</span>
     </div>
     <input type="range" min={min} max={max} step={step} value={value} onChange={e => onChange(+e.target.value)}
@@ -252,20 +252,20 @@ const SL = ({ label, value, min, max, step, onChange, fmt }) => (
   </div>
 );
 
-const Tag = ({ ok, warn, children }) => (
-  <span style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: ok ? "var(--ok-bg)" : warn ? "var(--wn-bg)" : "var(--cr-bg)", color: ok ? "var(--ok)" : warn ? "var(--wn)" : "var(--cr)", marginLeft: 3, whiteSpace: "nowrap" }}>{children}</span>
+const Tag = ({ ok, warn, children, tip }) => (
+  <span title={tip} style={{ fontSize: 8, padding: "1px 4px", borderRadius: 3, background: ok ? "var(--ok-bg)" : warn ? "var(--wn-bg)" : "var(--cr-bg)", color: ok ? "var(--ok)" : warn ? "var(--wn)" : "var(--cr)", marginLeft: 3, whiteSpace: "nowrap", cursor: tip ? "help" : "default" }}>{children}</span>
 );
 
-const MC = ({ label, val, sub, ch }) => (
-  <div style={{ background: "var(--bg-2)", borderRadius: 6, padding: "4px 7px" }}>
+const MC = ({ label, val, sub, ch, tip }) => (
+  <div style={{ background: "var(--bg-2)", borderRadius: 6, padding: "4px 7px", cursor: tip ? "help" : "default" }} title={tip}>
     <div style={{ fontSize: 9, color: "var(--text-2)" }}>{label}</div>
     <div style={{ fontSize: 14, fontWeight: 500, fontVariantNumeric: "tabular-nums" }}>{val}</div>
     {sub && <div style={{ fontSize: 9, color: "var(--text-2)" }}>{sub}{ch}</div>}
   </div>
 );
 
-const CR = ({ l, v, c }) => (
-  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 2 }}>
+const CR = ({ l, v, c, tip }) => (
+  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, marginBottom: 2, cursor: tip ? "help" : "default" }} title={tip}>
     <span style={{ color: "var(--text-2)" }}>{l}</span>
     <span style={{ fontWeight: 500, color: c || "inherit", fontVariantNumeric: "tabular-nums" }}>{v}</span>
   </div>
@@ -339,14 +339,34 @@ function TCPAChart({ effR, hz, rNM, sp }) {
   );
 }
 
-function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes }) {
+function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes, sp }) {
   const cv = closestV(rcs);
   const beamM = effR * 1852 * bw * Math.PI / 180;
   const Ga = GfnBand(apt, band);
+  const rRes = presetRangeRes || clutterRangeRes(techClass);
   const det = useMemo(() => VESSELS.map(v => {
     const env = effRangeWithEnv(pw, Ga, v.rcs_x, band, bw, ha, v.height, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes);
     return { v, range: env.effR, hz: env.hz, limF: env.limFactor };
   }), [pw, Ga, ha, band, bw, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes]);
+
+  // vessel-specific detection info
+  const cvDet = det.find(d => d.v.type === cv.type);
+  const cvRange = cvDet ? cvDet.range : effR;
+  const cvHz = cvDet ? cvDet.hz : 0;
+  const cvTcpa = (cvRange / sp) * 60;
+  const cvLimF = cvDet ? cvDet.limF : "power";
+
+  // beam analysis at detection range
+  const beamAtDet = cvRange * 1852 * bw * Math.PI / 180;
+  const azCells = beamAtDet > 0 ? cv.loa / beamAtDet : 0;
+  const rngCells = cv.loa > 0 ? cv.loa / rRes : 0;
+  const vesselAngularExtent = cv.loa > 0 ? (cv.loa / (cvRange * 1852)) * (180 / Math.PI) : 0;
+  const beamsAcross = vesselAngularExtent / bw;
+
+  // tier classification
+  const tier = cv.rcs_x >= 1000 ? 1 : cv.rcs_x >= 100 ? 2 : 3;
+  const tierLabel = tier === 1 ? "Tier 1: primary SCE threat" : tier === 2 ? "Tier 2: monitoring" : "Tier 3: close-range only";
+  const ermOk = cvTcpa >= 50;
 
   // dynamic scale: ensure horizon labels never overlap the detection range values
   // horizon label sits at hzW%. Keep max horizon at most ~95% of bar width.
@@ -357,7 +377,7 @@ function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, sea
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
       <div>
-        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }}>Vessel scale comparison <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
+        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }} title="Vessel types drawn at relative scale. Width represents LOA, height represents superstructure height. Click any vessel to set the target RCS and update all calculations. Selected vessel shown highlighted with full dimensions.">Vessel scale comparison <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
         {VESSELS.map(v => {
           const hit = v.type === cv.type;
           const w = Math.max(6, (v.loa / 220) * 100);
@@ -370,22 +390,36 @@ function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, sea
           );
         })}
         <div style={{ marginTop: 6, background: "var(--bg-2)", borderRadius: 6, padding: "5px 8px", fontSize: 9 }}>
-          <div style={{ fontWeight: 500, marginBottom: 1 }}>{cv.label} (IALA T{cv.type})</div>
-          <div style={{ color: "var(--text-2)" }}>LOA {cv.loa}m | Beam {cv.beam}m | Ht {cv.height}m</div>
-          <div style={{ color: cv.loa < beamM ? "var(--ok)" : "var(--wn)", marginTop: 1 }}>
-            {cv.loa < beamM ? "Fits within" : "Exceeds"} beam ({cv.loa}m vs {beamM.toFixed(0)}m)
+          <div style={{ fontWeight: 500, marginBottom: 1 }} title="Vessel classification per IALA Recommendation V-128 for radar target types. Type number indicates the typical radar cross-section category.">{cv.label} (IALA T{cv.type})</div>
+          <div style={{ color: "var(--text-2)" }} title="LOA = length overall. Beam = vessel beam (width). Ht = superstructure height above waterline (used for radar horizon calculation). RCS = radar cross-section in m².">LOA {cv.loa}m | Beam {cv.beam}m | Ht {cv.height}m | RCS {cv.rcs_x.toLocaleString()}m²</div>
+          <div style={{ color: tier === 1 ? "var(--ok)" : tier === 2 ? "var(--wn)" : "var(--cr)", marginTop: 1, fontSize: 8 }} title="Tier 1 (RCS >= 1000m²): large commercial vessels, primary collision threat to platform, requires full TCPA margin. Tier 2 (RCS 100-1000m²): medium vessels, monitoring required. Tier 3 (RCS < 100m²): small craft, detection may be limited by sea clutter.">
+            {tierLabel}
+          </div>
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 3, paddingTop: 3 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Maximum range at which this vessel type can be reliably detected by the current radar configuration. Limiting factor shown in brackets: horizon (earth curvature), power (noise-limited), rain (attenuation/backscatter), or clutter+MTI (sea clutter after Doppler processing).">
+              <span style={{ color: "var(--text-2)" }}>Detection range</span>
+              <span style={{ fontWeight: 500 }}>{cvRange.toFixed(1)} NM ({cvLimF})</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Time from first detection to closest point of approach at the design vessel speed. ERM (Emergency Response Measure) requires >= 50 minutes for the CARS Safety Case to allow time for radio contact, course monitoring, and evacuation initiation if required.">
+              <span style={{ color: "var(--text-2)" }}>TCPA at {sp} kn</span>
+              <span style={{ fontWeight: 500, color: ermOk ? "var(--ok)" : cvTcpa >= 25 ? "var(--wn)" : "var(--cr)" }}>{cvTcpa.toFixed(1)} min {ermOk ? "(ERM ok)" : cvTcpa >= 25 ? "(<50 min)" : "(critical)"}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Radar horizon for this vessel type, based on IALA formula: Hz = 2.2 x (sqrt(antenna_height) + sqrt(vessel_height)). Beyond this range the target is below the earth's curvature and cannot be detected regardless of radar power.">
+              <span style={{ color: "var(--text-2)" }}>Horizon</span>
+              <span>{cvHz.toFixed(1)} NM</span>
+            </div>
           </div>
         </div>
       </div>
       <div>
-        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }}>Detection range by type <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
+        <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 4 }} title="Effective detection range for each IALA vessel type (T1-T7). Coloured bar = detection range. Red dashed line = radar horizon for that vessel's height. Number on right = effective range in NM. Click any row to set the target RCS.">Detection range by type <span style={{ fontSize: 8, fontWeight: 400 }}>(click to select)</span></div>
         {det.map((d, i) => {
           const hit = d.v.type === cv.type;
           const barW = Math.max(2, (d.range / maxR) * 100);
           const hzW = Math.min(100, (d.hz / maxR) * 100);
           const tc = d.v.rcs_x >= 1000 ? "#185FA5" : d.v.rcs_x >= 100 ? "#1D9E75" : "#BA7517";
           return (
-            <div key={i} onClick={() => onSetRcs(d.v.rcs_x)} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 3, cursor: "pointer", padding: "1px 2px", borderRadius: 3, background: hit ? "var(--bg-2)" : "transparent", transition: "all 0.12s" }}>
+            <div key={i} onClick={() => onSetRcs(d.v.rcs_x)} title={`${d.v.label}: LOA ${d.v.loa}m, Ht ${d.v.height}m, RCS ${d.v.rcs_x.toLocaleString()}m². Detection: ${d.range.toFixed(1)} NM (${d.limF}). Horizon: ${d.hz.toFixed(1)} NM. TCPA: ${(d.range / sp * 60).toFixed(0)} min at ${sp} kn.`} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 3, cursor: "pointer", padding: "1px 2px", borderRadius: 3, background: hit ? "var(--bg-2)" : "transparent", transition: "all 0.12s" }}>
               <span style={{ fontSize: 8, color: "var(--text-2)", width: 14, textAlign: "right", flexShrink: 0 }}>T{d.v.type}</span>
               <div style={{ flex: 1, position: "relative", height: 10 }}>
                 <div style={{ width: `${barW}%`, height: "100%", background: tc + (hit ? "77" : "44"), borderRadius: 2 }} />
@@ -398,9 +432,39 @@ function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, sea
         })}
         <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: 2 }}>Red dash = radar horizon | 0-{maxR} NM</div>
         <div style={{ marginTop: 6, background: "var(--bg-2)", borderRadius: 6, padding: "5px 8px", fontSize: 9 }}>
-          <div style={{ fontWeight: 500, marginBottom: 1 }}>Beam footprint at {effR.toFixed(1)} NM</div>
-          <div style={{ color: "var(--text-2)" }}>Cross-range: {beamM.toFixed(0)}m ({(beamM / 1852).toFixed(2)} NM) at {bw.toFixed(2)}°</div>
-          <div style={{ color: "var(--text-2)" }}>Min sep: {beamM.toFixed(0)}m azimuth / 7.5m range</div>
+          <div style={{ fontWeight: 500, marginBottom: 2 }} title="Beam footprint and resolution cell analysis at the detection range for the selected vessel type. Determines target discrimination capability and whether the vessel is resolved or unresolved.">Beam and resolution at {cvRange.toFixed(1)} NM</div>
+          <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Cross-range (azimuth) dimension of the -3dB beam footprint at detection range. Equals range x beamwidth (radians). Targets closer together than this in azimuth cannot be distinguished as separate objects.">
+            <span style={{ color: "var(--text-2)" }}>Cross-range (az)</span>
+            <span>{beamAtDet.toFixed(0)}m ({(beamAtDet / 1852).toFixed(2)} NM)</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Range resolution determined by the radar's waveform. Pulse-compressed solid-state: 7.5m. Basic solid-state Doppler: 10m. Magnetron: 75m. Finer resolution = smaller clutter cell = better detection in sea clutter.">
+            <span style={{ color: "var(--text-2)" }}>Range resolution</span>
+            <span>{rRes}m ({band}-Band {clutterLabel(techClass).split(" ")[0]})</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Minimum distance between two targets for the radar to resolve them as separate objects. Azimuth separation = beam footprint width. Range separation = range resolution cell size.">
+            <span style={{ color: "var(--text-2)" }}>Min target sep.</span>
+            <span>{beamAtDet.toFixed(0)}m az / {rRes}m rng</span>
+          </div>
+          <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 3, paddingTop: 3 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Whether the vessel's LOA fits within a single beam footprint at detection range. If it fits, the vessel appears as a single point target. If it spans multiple beams, it may be resolved as an extended target (better for tracking but may split into multiple plots).">
+              <span style={{ color: "var(--text-2)" }}>Vessel in beam</span>
+              <span style={{ color: cv.loa < beamAtDet ? "var(--ok)" : "var(--wn)" }}>
+                {cv.loa < beamAtDet ? `Fits (${cv.loa}m in ${beamAtDet.toFixed(0)}m)` : `Spans ${beamsAcross.toFixed(1)} beams`}
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="The angle subtended by the vessel's LOA at detection range, shown as degrees and as a percentage of the radar beamwidth. A vessel filling >100% of the beam will be resolved across multiple beam positions.">
+              <span style={{ color: "var(--text-2)" }}>Angular extent</span>
+              <span>{vesselAngularExtent.toFixed(3)}° ({(vesselAngularExtent / bw * 100).toFixed(0)}% of beam)</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Number of independent azimuth resolution cells across the vessel's LOA. <1 means the vessel is unresolved in azimuth (appears as a point target). More cells = better target characterisation and tracking accuracy.">
+              <span style={{ color: "var(--text-2)" }}>Az cells across</span>
+              <span>{azCells < 1 ? `<1 (unresolved)` : `${azCells.toFixed(1)} cells`}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", cursor: "help" }} title="Number of range resolution cells across the vessel's LOA (broadside aspect). More range cells = better range profile for target classification. A 7m boat in 7.5m cells gives ~1 cell; a 220m tanker gives ~29 cells.">
+              <span style={{ color: "var(--text-2)" }}>Rng cells across</span>
+              <span>{rngCells.toFixed(0)} cells ({rRes}m each)</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -810,7 +874,7 @@ function App() {
           <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 8, letterSpacing: "-0.02em" }}>CARS radar explorer</div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
-            <span style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Model presets</span>
+            <span style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px" }} title="Pre-configured radar models from the Gate 2 comparison matrix. Click to load all parameters (power, aperture, beamwidth, band, weight, cost). Use '+ Add' to define custom radar configurations for comparison.">Model presets</span>
             <button onClick={() => setShowAdd(!showAdd)} style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, border: "0.5px solid var(--border)", background: showAdd ? "var(--accent-bg)" : "var(--bg-1)", color: showAdd ? "var(--accent-text)" : "var(--text-2)", cursor: "pointer" }}>{showAdd ? "Cancel" : "+ Add"}</button>
           </div>
 
@@ -894,11 +958,11 @@ function App() {
                 <div style={{ fontWeight: 500, color: ap === r.id ? "var(--accent-text)" : "var(--text-1)" }}>{r.name}</div>
                 <div style={{ fontSize: 8, opacity: 0.6 }}>{r.band} {r.pw}W {r.apt}ft</div>
                 <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
-                  {r.rec && <Tag ok>Rec</Tag>}
-                  {r.custom && <Tag warn>Custom</Tag>}
-                  {r.wind && r.wind < 100 && <Tag>70kn</Tag>}
-                  {r.iec === "None" && <Tag warn>No IEC</Tag>}
-                  {r.band === "S" && <Tag warn>S</Tag>}
+                  {r.rec && <Tag ok tip="Recommended option from Gate 2 assessment based on performance, cost, compliance, and integration capability.">Rec</Tag>}
+                  {r.custom && <Tag warn tip="User-added custom radar preset. Parameters are manually entered and not from a vendor datasheet.">Custom</Tag>}
+                  {r.wind && r.wind < 100 && <Tag tip="Maximum wind speed rating below the GP 31-03-01U requirement of 100 kn for offshore platforms.">70kn</Tag>}
+                  {r.iec === "None" && <Tag warn tip="No IEC 62388 type approval. Not compliant with SOLAS navigation radar standards. May affect Safety Case acceptance.">No IEC</Tag>}
+                  {r.band === "S" && <Tag warn tip="S-Band (3 GHz): better rain penetration and lower sea clutter than X-Band, but larger antenna required (12ft+). Typically used as complement to X-Band primary.">S</Tag>}
                 </div>
                 {r.custom && (
                   <span onClick={e => { e.stopPropagation(); if (ap === r.id) setAp(null); setRadars(radars.filter(x => x.id !== r.id)); }} style={{ position: "absolute", top: 1, right: 2, fontSize: 9, color: "var(--cr)", cursor: "pointer", lineHeight: 1, opacity: 0.6 }} title="Remove">×</span>
@@ -907,16 +971,16 @@ function App() {
             ))}
           </div>
 
-          <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Parameters</div>
-          <SL label="Peak power" value={pw} min={50} max={2000} step={10} onChange={v => { clrP(); setPw(v); }} fmt={v => `${v} W`} />
-          <SL label="Aperture" value={apt} min={4} max={14} step={0.5} onChange={v => { clrP(); setApt(v); }} fmt={v => `${v.toFixed(1)} ft`} />
-          <SL label="Height ASL" value={ha} min={15} max={100} step={0.5} onChange={v => setHa(v)} fmt={v => `${v.toFixed(1)} m`} />
-          <SL label="Beamwidth" value={bw} min={0.8} max={2.5} step={0.01} onChange={v => { clrP(); setBw(v); }} fmt={v => `${v.toFixed(2)}°`} />
-          <SL label="Target RCS" value={rcs} min={1} max={10000} step={1} onChange={v => setRcs(v)} fmt={v => `${v.toLocaleString()} m²`} />
-          <SL label="Speed" value={sp} min={5} max={30} step={1} onChange={v => setSp(v)} fmt={v => `${v} kn`} />
+          <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }} title="Radar and scenario parameters. Adjusting power, aperture, or beamwidth clears the active preset (enters custom mode). Height, RCS, and speed can be adjusted without clearing the preset.">Parameters</div>
+          <SL label="Peak power" value={pw} min={50} max={2000} step={10} onChange={v => { clrP(); setPw(v); }} fmt={v => `${v} W`} tip="Transmitter peak power in watts. Higher power increases noise-limited detection range (4th root relationship). Solid-state radars are typically 100-600W; magnetrons 5-25kW." />
+          <SL label="Aperture" value={apt} min={4} max={14} step={0.5} onChange={v => { clrP(); setApt(v); }} fmt={v => `${v.toFixed(1)} ft`} tip="Antenna aperture (length). Larger aperture = higher gain and narrower beamwidth. Affects structural steel cost and cantilever loading. 6ft is standard marine; 12-14ft is VTS-grade." />
+          <SL label="Height ASL" value={ha} min={15} max={100} step={0.5} onChange={v => setHa(v)} fmt={v => `${v.toFixed(1)} m`} tip="Antenna height above sea level. Directly sets the radar horizon distance via the IALA formula: Hz = 2.2 x (sqrt(ha) + sqrt(ht)). BTA=23.5m, MLA=38m, WTN/TNA=33m." />
+          <SL label="Beamwidth" value={bw} min={0.8} max={2.5} step={0.01} onChange={v => { clrP(); setBw(v); }} fmt={v => `${v.toFixed(2)}°`} tip="Horizontal beamwidth (-3dB). Determines cross-range resolution and target discrimination. Narrower beam = smaller clutter cell = better detection in sea clutter. Inversely proportional to aperture." />
+          <SL label="Target RCS" value={rcs} min={1} max={10000} step={1} onChange={v => setRcs(v)} fmt={v => `${v.toLocaleString()} m²`} tip="Radar cross-section of the target vessel in m². Varies by vessel size and aspect: T1 small boat ~1m², T4 fishing/tug ~100m², T7 container ship ~100,000m². Click vessel types in the panel to set." />
+          <SL label="Speed" value={sp} min={5} max={30} step={1} onChange={v => setSp(v)} fmt={v => `${v} kn`} tip="Design approach speed of the target vessel. Used to calculate TCPA from effective detection range. Gate 2 design speed is 17 kn (P90 for Gippsland Basin commercial traffic)." />
 
           <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
-            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Band</div>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }} title="Radar frequency band. X-Band (9.4 GHz) is standard marine radar with good angular resolution but susceptible to rain attenuation. S-Band (3.05 GHz) penetrates rain ~17x better and has lower sea clutter, but requires a larger antenna (12ft+) for equivalent beamwidth. Selecting a preset sets the band automatically.">Band</div>
             <div style={{ display: "flex", gap: 3, marginBottom: 6 }}>
               {["X", "S"].map(b => (
                 <button key={b} onClick={() => { clrP(); setBand(b); }} style={{ flex: 1, padding: "3px 0", borderRadius: 4, border: band === b ? "1.5px solid var(--accent)" : "0.5px solid var(--border)", background: band === b ? "var(--accent-bg)" : "var(--bg-1)", color: band === b ? "var(--accent-text)" : "var(--text-2)", cursor: "pointer", fontSize: 9, fontWeight: 500 }}>
@@ -927,17 +991,17 @@ function App() {
           </div>
 
           <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
-            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Environment</div>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }} title="Environmental degradation effects on detection range. These are first-order estimates for comparative trade studies only. Not suitable for operational prediction. Toggle each effect on/off independently. When off, detection is noise-limited and horizon-limited only.">Environment</div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
               <button onClick={() => setRainOn(!rainOn)} style={{ width: 28, height: 14, borderRadius: 7, border: "none", background: rainOn ? "var(--accent)" : "var(--border)", cursor: "pointer", position: "relative", transition: "background 0.15s" }}>
                 <div style={{ width: 10, height: 10, borderRadius: 5, background: "#fff", position: "absolute", top: 2, left: rainOn ? 16 : 2, transition: "left 0.15s" }} />
               </button>
-              <span style={{ fontSize: 10, color: rainOn ? "var(--text-1)" : "var(--text-2)" }}>Rain attenuation</span>
+              <span style={{ fontSize: 10, color: rainOn ? "var(--text-1)" : "var(--text-2)", cursor: "help" }} title="Models two-way rain path attenuation (ITU-R P.838-3) and rain backscatter volume clutter (Marshall-Palmer Z-R). X-Band is severely affected; S-Band is nearly transparent to rain.">Rain attenuation</span>
             </div>
             {rainOn && (
               <div style={{ marginBottom: 6, paddingLeft: 33 }}>
-                <SL label="Rain rate" value={rainRate} min={0} max={100} step={0.5} onChange={v => setRainRate(v)} fmt={v => `${v.toFixed(1)} mm/hr`} />
+                <SL label="Rain rate" value={rainRate} min={0} max={100} step={0.5} onChange={v => setRainRate(v)} fmt={v => `${v.toFixed(1)} mm/hr`} tip="Rainfall rate in mm/hr. Default 34.7 mm/hr is R0.01 from ITU-R P.837-7 for the Gippsland Basin (exceeded 0.01% of year). Two-way path attenuation and rain backscatter (volume clutter) both increase with rain rate. X-Band is ~17x more attenuated than S-Band." />
                 <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: -3 }}>
                   Path atten: {rainAtten(rainRate, band).toFixed(3)} dB/km ({band}-Band) | {rainOn && effR > 0 ? `${rainLoss.toFixed(1)} dB two-way` : "off"}
                 </div>
@@ -951,11 +1015,11 @@ function App() {
               <button onClick={() => setClutterOn(!clutterOn)} style={{ width: 28, height: 14, borderRadius: 7, border: "none", background: clutterOn ? "var(--accent)" : "var(--border)", cursor: "pointer", position: "relative", transition: "background 0.15s" }}>
                 <div style={{ width: 10, height: 10, borderRadius: 5, background: "#fff", position: "absolute", top: 2, left: clutterOn ? 16 : 2, transition: "left 0.15s" }} />
               </button>
-              <span style={{ fontSize: 10, color: clutterOn ? "var(--text-1)" : "var(--text-2)" }}>Sea clutter</span>
+              <span style={{ fontSize: 10, color: clutterOn ? "var(--text-1)" : "var(--text-2)", cursor: "help" }} title="Models sea surface clutter using Nathanson sigma-zero tables with Doppler/MTI processing gains (CIF). Clutter fills each resolution cell; the target must exceed the residual clutter after MTI suppression. S-Band has ~8 dB lower sea backscatter than X-Band, plus better MTI from narrower clutter Doppler spread.">Sea clutter</span>
             </div>
             {clutterOn && (
               <div style={{ marginBottom: 6, paddingLeft: 33 }}>
-                <SL label="Sea state" value={seaState} min={0} max={6} step={1} onChange={v => setSeaState(v)} fmt={v => `SS${v}`} />
+                <SL label="Sea state" value={seaState} min={0} max={6} step={1} onChange={v => setSeaState(v)} fmt={v => `SS${v}`} tip="Douglas sea state scale (0-6). SS4 is the P90 design case for Gippsland Basin. Higher sea states increase surface clutter backscatter (sigma-zero), reducing detection of small targets. S-Band has ~8dB lower sea clutter than X-Band. Doppler/MTI processing suppresses clutter by 23-38 dB depending on radar technology." />
                 <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: -3 }}>
                   {seaState === 0 ? "Calm (glassy)" : seaState <= 2 ? "Slight" : seaState <= 4 ? "Moderate" : "Rough"} | {clutterLabel(techClass)}: CIF {clutterCIF(techClass, band)} dB{band === "S" ? " (inc. +3 dB S-Band)" : ""}
                 </div>
@@ -970,49 +1034,49 @@ function App() {
           </div>
 
           <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
-            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>Key metrics</div>
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }} title="Summary performance and cost metrics for the current configuration. Effective range accounts for noise, horizon, and any enabled environmental effects. TCPA must exceed 50 min for CARS ERM compliance.">Key metrics</div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
-              <MC label="Eff. range" val={`${effR.toFixed(1)} NM`} sub={`${limFactor}-lim`} />
-              <MC label="TCPA" val={`${tcpa.toFixed(1)} min`} sub={`${sp} kn`} ch={<Tag ok={tcpa >= 50} warn={tcpa >= 25 && tcpa < 50}>{tcpa >= 50 ? "ERM ok" : tcpa >= 25 ? "<50" : "Crit"}</Tag>} />
-              <MC label="Beam" val={`${beamM.toFixed(0)} m`} sub={`${effR.toFixed(1)} NM`} ch={<Tag ok={bw <= 1.4} warn={bw > 1.4}>BW-01</Tag>} />
-              <MC label="Per pos." val={`$${(per / 1000).toFixed(0)}k`} sub={`5p $${(per * 5 / 1000).toFixed(0)}k`} />
+              <MC label="Eff. range" val={`${effR.toFixed(1)} NM`} sub={`${limFactor}-lim`} tip="Effective detection range: the lesser of noise-limited range, radar horizon, and any environmental degradation (rain/clutter). This is the maximum range at which the selected target can be reliably detected." />
+              <MC label="TCPA" val={`${tcpa.toFixed(1)} min`} sub={`${sp} kn`} ch={<Tag ok={tcpa >= 50} warn={tcpa >= 25 && tcpa < 50} tip={tcpa >= 50 ? "Meets ERM requirement of 50+ min TCPA for CARS Safety Case" : tcpa >= 25 ? "Below 50 min ERM threshold. May require additional mitigation." : "Critical: insufficient warning time for Emergency Response Measures."}>{tcpa >= 50 ? "ERM ok" : tcpa >= 25 ? "<50" : "Crit"}</Tag>} tip="Time to Closest Point of Approach. Calculated as effective range / vessel speed. Must exceed 50 min to satisfy CARS Emergency Response Measure per Safety Case." />
+              <MC label="Beam" val={`${beamM.toFixed(0)} m`} sub={`${effR.toFixed(1)} NM`} ch={<Tag ok={bw <= 1.4} warn={bw > 1.4} tip={bw <= 1.4 ? "Beamwidth within GP 31-03-01U requirement (<=1.4 deg)" : "Beamwidth exceeds GP 31-03-01U guideline. May reduce target discrimination."}>BW-01</Tag>} tip="Cross-range beam footprint at effective detection range. Determines minimum azimuth separation between two targets and the size of the clutter resolution cell." />
+              <MC label="Per pos." val={`$${(per / 1000).toFixed(0)}k`} sub={`5p $${(per * 5 / 1000).toFixed(0)}k`} tip="Total estimated cost per radar position: radar unit + structural steel (engineering + fabrication) + cantilever premium + power infrastructure. 5p = extrapolated for all 5 positions across 4 platforms (1 spare)." />
             </div>
           </div>
 
           <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
-            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Cost / position</div>
-            <CR l="Radar unit" v={`$${(rc / 1000).toFixed(0)}k`} c="var(--accent)" />
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }} title="Estimated installed cost per radar position. Includes radar hardware, structural steel (engineering + fabrication), cantilever extension premium, and power supply infrastructure. Based on the Gate 2 structural steel estimate ($150k engineering / $60k X-Band fab / $150k S-Band fab per platform). All estimates +/-30%.">Cost / position</div>
+            <CR l="Radar unit" v={`$${(rc / 1000).toFixed(0)}k`} c="var(--accent)" tip="Radar hardware cost (ex GST): scanner, processor, display, and accessories. From vendor quotation when preset selected; estimated from parameters otherwise." />
             {preset && <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 3, marginTop: -1 }}>{preset.name} (ex GST)</div>}
             {!preset && <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 3, marginTop: -1 }}>Est. from parameters</div>}
-            <CR l="Steel (eng. + fab.)" v={`$${(sb / 1000).toFixed(0)}k`} />
+            <CR l="Steel (eng. + fab.)" v={`$${(sb / 1000).toFixed(0)}k`} tip="Structural steel per platform: $37.5k engineering allocation (share of $150k across 4 platforms for drawings, modelling, site visits, tech spec) + fabrication (X-Band ~$60k at 0.5t, S-Band ~$150k at 2.5x multiplier for heavier structure)." />
             <div style={{ fontSize: 8, color: "var(--text-2)", marginBottom: 2, marginTop: -1 }}>Eng $38k + Fab ${((sb - 37500) / 1000).toFixed(0)}k</div>
-            <CR l="Cant. premium" v={`+$${(cc / 1000).toFixed(0)}k`} c={cc > 0 ? "var(--cr)" : undefined} />
-            <CR l="Power infra." v={`$${(pp / 1000).toFixed(0)}k`} c={pp > 0 ? "var(--wn)" : undefined} />
+            <CR l="Cant. premium" v={`+$${(cc / 1000).toFixed(0)}k`} c={cc > 0 ? "var(--cr)" : undefined} tip="Additional cost for cantilever extension beyond 1.0m baseline. $36k/m covers structural steel ($28k/m) + galvanised grating decking, handrails, and kickplate ($8k/m). Driven by RADHAZ clearance and antenna half-width." />
+            <CR l="Power infra." v={`$${(pp / 1000).toFixed(0)}k`} c={pp > 0 ? "var(--wn)" : undefined} tip="Power supply infrastructure premium: UPS, cabling, junction boxes, lightning protection. Scales with transmitter power class. Nil for low-power SS (<=150W); up to $75k for high-power systems." />
             <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 3, paddingTop: 3 }}>
-              <CR l="Per position" v={`$${(per / 1000).toFixed(0)}k`} c="var(--accent)" />
-              <CR l="5-pos network" v={`$${(per * 5 / 1000).toFixed(0)}k`} c="var(--accent)" />
+              <CR l="Per position" v={`$${(per / 1000).toFixed(0)}k`} c="var(--accent)" tip="Total installed cost per radar position: unit + steel + cantilever + power infrastructure." />
+              <CR l="5-pos network" v={`$${(per * 5 / 1000).toFixed(0)}k`} c="var(--accent)" tip="Extrapolated cost for 5 radar positions across the 4-platform network (BTA, MLA, WTN, TNA + 1 spare). Does not include AIS, comms backhaul, or CMS integration." />
             </div>
             <div style={{ fontSize: 8, color: "var(--text-2)", marginTop: 2 }}>All estimates ±30%</div>
           </div>
 
           <div style={{ borderTop: "0.5px solid var(--border)", marginTop: 6, paddingTop: 6 }}>
-            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }}>Installation</div>
-            <CR l="Scanner weight" v={`${scanW} kg`} />
-            <CR l="Pedestal/mount" v={`${pedW_} kg`} />
-            <CR l="Cant. steel" v={`~${cantSteelW} kg`} />
-            <CR l="Cant. decking" v={`~${cantDeckW} kg`} />
-            <CR l="Total weight" v={`~${totW} kg`} />
-            <CR l="RADHAZ (edge)" v={`${rR.toFixed(2)} m`} c={rR < 0.3 ? "var(--ok)" : rR < 1 ? "var(--wn)" : "var(--cr)"} />
-            <CR l="Ant. half-width" v={`${hw.toFixed(2)} m`} />
-            <CR l="Cantilever" v={`${cL.toFixed(2)} m`} />
-            <CR l="Pedestal" v={`${pedHt(apt).toFixed(1)}m x ${pedWd(apt).toFixed(2)}m`} />
-            {preset && <CR l="IEC 62388" v={preset.iec} />}
-            {preset && <CR l="Wind" v={preset.wind ? `${preset.wind} kn` : "N/P"} c={preset.wind && preset.wind < 100 ? "var(--cr)" : undefined} />}
+            <div style={{ fontSize: 9, fontWeight: 500, color: "var(--text-2)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 3 }} title="Physical installation parameters: component weights, RADHAZ exclusion zone, cantilever geometry, pedestal dimensions, and compliance status. Scanner weight uses manufacturer spec when a preset is selected. Cantilever length is driven by RADHAZ clearance from antenna element edges per GP 31-03-03U.">Installation</div>
+            <CR l="Scanner weight" v={`${scanW} kg`} tip="Weight of the radar scanner unit (antenna + radome + motor/gearbox). Uses manufacturer spec sheet value when a preset is selected; estimated from aperture size for custom configurations." />
+            <CR l="Pedestal/mount" v={`${pedW_} kg`} tip="Pedestal and mounting structure weight: motor base, bearing housing, mounting flange. Sized by antenna aperture class (25kg for <=8ft, 35kg for <=12ft, 45kg for 13ft+)." />
+            <CR l="Cant. steel" v={`~${cantSteelW} kg`} tip="Structural steel beam weight for the cantilever arm at ~18 kg/m. Cantilever length is driven by RADHAZ clearance from the antenna element edge plus walkway and safety gap." />
+            <CR l="Cant. decking" v={`~${cantDeckW} kg`} tip="Galvanised grating decking weight for maintenance access walkway: 0.8m wide at ~25 kg/m² = ~20 kg/m of cantilever length. Includes grating, support clips, and fixings." />
+            <CR l="Total weight" v={`~${totW} kg`} tip="Total weight at the cantilever tip: scanner + pedestal + cantilever steel + decking. This is the key structural load for the steel design and determines the cantilever section size." />
+            <CR l="RADHAZ (edge)" v={`${rR.toFixed(2)} m`} c={rR < 0.3 ? "var(--ok)" : rR < 1 ? "var(--wn)" : "var(--cr)"} tip="Radiation hazard exclusion zone radius from the antenna element edge, per GP 31-03-03U. Calculated as 2.2 x sqrt(Pt / 12000). Personnel must not enter this zone during operation. Drives the minimum cantilever length." />
+            <CR l="Ant. half-width" v={`${hw.toFixed(2)} m`} tip="Half the physical antenna aperture length. The RADHAZ zone is measured from each element edge (not the antenna centre), so this dimension contributes to the cantilever length calculation." />
+            <CR l="Cantilever" v={`${cL.toFixed(2)} m`} tip="Total cantilever length from deck edge to antenna centre: 0.8m walkway + antenna half-width + RADHAZ zone + 0.5m safety clearance (minimum 1.0m). Determines structural cost premium and tip loading." />
+            <CR l="Pedestal" v={`${pedHt(apt).toFixed(1)}m x ${pedWd(apt).toFixed(2)}m`} tip="Pedestal height x base diameter. Sized to clear deck obstructions and provide adequate vertical beam clearance. Height increases with antenna size to avoid near-field interference." />
+            {preset && <CR l="IEC 62388" v={preset.iec} tip="IEC 62388 type approval category. CAT 1 = SOLAS vessels >10,000 GT. CAT 2 = SOLAS vessels 500-10,000 GT. CAT 3 = SOLAS vessels <500 GT. VTS = shore-based vessel traffic service. None = recreational/non-type-approved." />}
+            {preset && <CR l="Wind" v={preset.wind ? `${preset.wind} kn` : "N/P"} c={preset.wind && preset.wind < 100 ? "var(--cr)" : undefined} tip="Maximum operational wind speed. GP 31-03-01U requires 100 kn survival wind rating for offshore installations. Radars rated below 100 kn (e.g. DRS12A at 70 kn) do not meet the ExxonMobil standard and require a variance." />}
           </div>
         </div>
 
         <div style={{ overflowY: "auto", padding: "10px 14px" }}>
-          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }}>Detection range vs TCPA</div>
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }} title="Scatter plot showing effective detection range vs time to closest point of approach. Operating point (purple dot) should be above the 50 min ERM threshold (green dashed). Vertical lines show noise-limited range and radar horizon.">Detection range vs TCPA</div>
           <div style={{ height: 200, marginBottom: 4 }}>
             <TCPAChart effR={effR} hz={hz} rNM={rNM} sp={sp} />
           </div>
@@ -1024,10 +1088,10 @@ function App() {
             <span style={{ display: "flex", alignItems: "center", gap: 2 }}><span style={{ width: 10, borderTop: "1px dashed #534AB7", display: "inline-block" }} />Noise-lim</span>
           </div>
 
-          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }}>Target vessel profile and beam resolution</div>
-          <VesselPanel rcs={rcs} bw={bw} effR={effR} pw={pw} ha={ha} apt={apt} onSetRcs={setRcs} band={band} rainRate={rainRate} seaState={seaState} rainOn={rainOn} clutterOn={clutterOn} techClass={techClass} presetRangeRes={presetRangeRes} />
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginBottom: 3 }} title="Left: vessel types at relative scale with physical dimensions and RCS. Right: detection range bars for each vessel type with radar horizon indicators. Click any vessel to set the RCS slider and update all calculations. Info cards show vessel-specific detection, TCPA, and beam resolution analysis.">Target vessel profile and beam resolution</div>
+          <VesselPanel rcs={rcs} bw={bw} effR={effR} pw={pw} ha={ha} apt={apt} onSetRcs={setRcs} band={band} rainRate={rainRate} seaState={seaState} rainOn={rainOn} clutterOn={clutterOn} techClass={techClass} presetRangeRes={presetRangeRes} sp={sp} />
 
-          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginTop: 12, marginBottom: 3 }}>Platform installation geometry</div>
+          <div style={{ fontSize: 10, fontWeight: 500, color: "var(--text-2)", marginTop: 12, marginBottom: 3 }} title="Side elevation showing the platform jacket, topsides, cantilever arm with decking and handrails, radar pedestal, antenna, and RADHAZ exclusion zones. Vessel drawn at proportional scale with height dimension. Detection range and TCPA shown as dimension lines. Horizon indicated as vertical dashed red line.">Platform installation geometry</div>
           <PlatformSVG ha={ha} ft={apt} pw={pw} effR={effR} hz={hz} rcs={rcs} sp={sp} preset={ap} radars={radars} limFactor={limFactor} />
 
           <div style={{ marginTop: 6, fontSize: 8, color: "var(--text-2)", lineHeight: 1.4 }}>
