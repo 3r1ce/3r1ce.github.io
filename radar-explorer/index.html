@@ -18,6 +18,8 @@
     <script type="text/babel" data-type="module">
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
+// techClass: magnetron | ss_doppler | ss_pulsecomp | ss_coherent
+// Maps directly to CIF and range resolution rather than using power as proxy
 const DEFAULT_RADARS = [
   { id: "path16", name: "Pathfinder 16", band: "X", pw: 110, apt: 6, bw: 1.32, wt: 33, cost: 32999, iec: "CAT 3", wind: 100, tech: "SS CHIRP", techClass: "ss_pulsecomp", rangeRes: 7.5, rec: true },
   { id: "drs12a", name: "DRS12A-NXT", band: "X", pw: 100, apt: 6, bw: 1.35, wt: 34, cost: 15333, iec: "None", wind: 70, tech: "SS Doppler", techClass: "ss_doppler", rangeRes: 10, rec: false },
@@ -37,6 +39,7 @@ const VESSELS = [
   { type: 1, label: "Small open boat", loa: 7, beam: 2.5, height: 1, rcs_x: 1, color: "#A32D2D" },
 ];
 
+const PH = (() => { const o = { f: 9.41e9, c: 3e8, k: 1.38e-23, T: 290, NF: 4, SL: 6, SNR: 13, tau: 50e-6 }; o.lam = o.c / o.f; o.BW = 1 / o.tau; return o; })();
 const freqForBand = (band) => band === "S" ? 3.05e9 : 9.41e9;
 const lamForBand = (band) => 3e8 / freqForBand(band);
 const GfnBand = (ft, band) => { const m = ft * 0.3048; const lam = lamForBand(band); return (4 * Math.PI * m * 0.12 * 0.55) / (lam * lam); };
@@ -45,7 +48,12 @@ const RfnBand = (Pt, Ga, s, band) => {
   const BW = 1 / 50e-6;
   return (Pt * Ga * Ga * lam * lam * s / ((4 * Math.PI) ** 3 * 1.38e-23 * 290 * BW * 10 ** (4 / 10) * 10 ** (6 / 10) * 10 ** (13 / 10))) ** 0.25;
 };
+// legacy wrappers for non-band-aware calls
+const Gfn = (ft) => GfnBand(ft, "X");
+const Rfn = (Pt, Ga, s) => RfnBand(Pt, Ga, s, "X");
 
+// ITU-R P.838-3: specific attenuation gamma_R = k * R^alpha (dB/km)
+// Coefficients for horizontal polarisation
 const rainAtten = (rainRate, band) => {
   if (rainRate <= 0) return 0;
   let k, alpha;
@@ -54,22 +62,34 @@ const rainAtten = (rainRate, band) => {
   return k * Math.pow(rainRate, alpha);
 };
 
+// Rain backscatter (volume clutter from rain drops)
+// Reflectivity Z = 200 * R^1.6 (Marshall-Palmer, mm^6/m^3)
+// eta = (pi^5 / lam^4) * |K|^2 * Z  where |K|^2 ~ 0.93 for water
+// Rain clutter RCS per cell = eta * cell_volume
 const rainBackscatterEta = (rainRate, band) => {
   if (rainRate <= 0) return 0;
   const lam = lamForBand(band);
-  const Z = 200 * Math.pow(rainRate, 1.6);
-  const Zmm6 = Z * 1e-18;
+  const Z = 200 * Math.pow(rainRate, 1.6); // mm^6/m^3
+  const Zmm6 = Z * 1e-18; // convert to m^6/m^3
   const Kw2 = 0.93;
-  return (Math.PI ** 5 / lam ** 4) * Kw2 * Zmm6;
+  return (Math.PI ** 5 / lam ** 4) * Kw2 * Zmm6; // m^-1 (per metre of path)
 };
 
+// Clutter improvement factor by technology class
+// Based on published MTI/Doppler performance and vendor ratings
+// References: Skolnik Ch.3 (MTI), Nathanson Ch.7 (CFAR), vendor datasheets
 const TECH_CIF = {
   magnetron: { cif: 0, rangeRes: 75, label: "Magnetron (non-coherent)", rating: "Moderate" },
   ss_doppler: { cif: 23, rangeRes: 10, label: "SS Doppler", rating: "Good" },
   ss_pulsecomp: { cif: 27, rangeRes: 7.5, label: "SS pulse compression", rating: "Good+" },
+  // SharpEye / VTS-grade: fully coherent pulse-Doppler with long dwell,
+  // adaptive clutter maps, scan-to-scan integration, purpose-built target extraction.
+  // CIF includes: 26 dB MTI (longer CPI than marine radar) + 3 dB CFAR
+  // + 3 dB coherent integration + 3 dB adaptive clutter map / ASTERIX pipeline
   ss_coherent: { cif: 35, rangeRes: 7.5, label: "SS coherent (VTS-grade)", rating: "Very good" },
 };
-const SBAND_CIF_BONUS = 3;
+// S-Band bonus: narrower sea clutter Doppler spread improves MTI notch effectiveness
+const SBAND_CIF_BONUS = 3; // dB
 
 const clutterCIF = (techClass, band) => {
   const tc = TECH_CIF[techClass] || TECH_CIF.ss_doppler;
@@ -84,48 +104,73 @@ const clutterLabel = (techClass) => {
   return tc.label;
 };
 
+// Sea clutter sigma0: improved Nathanson model
+// sigma0(dB) = A + B*log10(grazing_angle) + C*sea_state
+// with band-dependent baseline (S-Band ~8 dB lower backscatter than X-Band)
+// Grazing angle dependence follows composite surface model
 const seaClutterSigma0 = (ss, grazingDeg, band) => {
   if (ss <= 0) return -999;
+  // Nathanson fit: sigma0 at 1° grazing, X-Band, H-pol
+  // SS1=-40, SS2=-34, SS3=-28, SS4=-22, SS5=-17, SS6=-13 (approx dB m²/m²)
   const ssTable = [-999, -40, -34, -28, -22, -17, -13];
   const s0base = ss <= 6 ? ssTable[ss] : -13 + (ss - 6) * 3;
+  // grazing angle: composite surface model ~10*log10(theta) for low angles
   const grazAdj = 10 * Math.log10(Math.max(0.05, grazingDeg));
+  // band: S-Band lower backscatter
   const bandAdj = band === "S" ? -8 : 0;
   return s0base + grazAdj + bandAdj;
 };
 
+// Effective range with rain attenuation, rain backscatter, and sea clutter
 const effRangeWithEnv = (Pt, Ga, rcs, band, bwDeg, ha, targetHt, rainRate, ss, rainOn, clutterOn, techClass, rangeResOverride) => {
   const lam = lamForBand(band);
   const BW = 1 / 50e-6;
   const noiseFloor = 1.38e-23 * 290 * BW * 10 ** (4 / 10) * 10 ** (6 / 10);
   const SNRmin = 10 ** (13 / 10);
   const hz = 2.2 * (Math.sqrt(ha) + Math.sqrt(targetHt));
+  
   const rNoise = (Pt * Ga * Ga * lam * lam * rcs / ((4 * Math.PI) ** 3 * noiseFloor * SNRmin)) ** 0.25;
   const rNoiseNM = rNoise / 1852;
+  
   if (!rainOn && !clutterOn) return { effR: Math.min(rNoiseNM, hz), rNM: rNoiseNM, hz, rainLoss: 0, rainClutterDb: 0, cifDb: 0, limFactor: rNoiseNM > hz ? "horizon" : "power" };
+  
   let maxR = Math.min(rNoiseNM, hz);
   const rainGamma = rainOn ? rainAtten(rainRate, band) : 0;
   const rainEta = rainOn ? rainBackscatterEta(rainRate, band) : 0;
+  
   const rangeRes = rangeResOverride || clutterRangeRes(techClass);
   const bwRad = bwDeg * Math.PI / 180;
   const cifDb = clutterOn ? clutterCIF(techClass, band) : 0;
   const cifLin = 10 ** (cifDb / 10);
+  
+  // finer step: 0.05 NM (~93m)
   for (let rNM = maxR; rNM > 0.3; rNM -= 0.05) {
     const rKm = rNM * 1.852;
     const rM = rNM * 1852;
+    
+    // rain path attenuation (two-way)
     const rainLossDb = rainOn ? 2 * rainGamma * rKm : 0;
     const rainLossFactor = 10 ** (rainLossDb / 10);
+    
+    // signal power at range
     const Pr = Pt * Ga * Ga * lam * lam * rcs / ((4 * Math.PI) ** 3 * rM ** 4);
     const PrAfterRain = Pr / rainLossFactor;
+    
+    // noise check
     const snr = PrAfterRain / noiseFloor;
     if (snr < SNRmin) continue;
+    
+    // rain backscatter (volume clutter from rain drops in the beam)
     if (rainOn && rainRate > 0) {
-      const cellVol = rM * bwRad * bwRad * rangeRes;
+      const cellVol = rM * bwRad * bwRad * rangeRes; // approx beam volume at range (simplified cone section)
       const rainClutterRCS = rainEta * cellVol;
       if (rainClutterRCS > 0) {
         const scrRain = rcs / rainClutterRCS;
         if (scrRain < SNRmin) continue;
       }
     }
+    
+    // sea clutter check with Doppler/MTI
     if (clutterOn && ss > 0) {
       const grazDeg = Math.atan2(ha, rM) * 180 / Math.PI;
       const s0dB = seaClutterSigma0(ss, grazDeg, band);
@@ -135,14 +180,21 @@ const effRangeWithEnv = (Pt, Ga, rcs, band, bwDeg, ha, targetHt, rainRate, ss, r
       const scr = rcs / Math.max(1e-10, effectiveClutterRCS);
       if (scr < SNRmin) continue;
     }
+    
     const totalRainLoss = rainOn ? 2 * rainGamma * rNM * 1.852 : 0;
     const isHzLim = rNM >= hz - 0.05;
     let detLimFactor = "power";
     if (isHzLim) detLimFactor = "horizon";
     else if (totalRainLoss > 3) detLimFactor = "rain";
     else if (clutterOn && ss > 0) detLimFactor = "clutter+MTI";
-    return { effR: Math.min(rNM, hz), rNM: rNoiseNM, hz, rainLoss: totalRainLoss, rainClutterDb: rainOn ? 10 * Math.log10(Math.max(1e-20, rainEta)) : -999, cifDb, limFactor: detLimFactor };
+    return { 
+      effR: Math.min(rNM, hz), rNM: rNoiseNM, hz, 
+      rainLoss: totalRainLoss,
+      rainClutterDb: rainOn ? 10 * Math.log10(Math.max(1e-20, rainEta)) : -999,
+      cifDb, limFactor: detLimFactor
+    };
   }
+  
   return { effR: 0.3, rNM: rNoiseNM, hz, rainLoss: rainOn ? 2 * rainGamma * 0.3 * 1.852 : 0, rainClutterDb: -999, cifDb, limFactor: "env" };
 };
 
@@ -151,8 +203,12 @@ const tHfn = (r) => r >= 1000 ? 8 : r >= 100 ? 5 : r >= 10 ? 3 : 1;
 const radE = (pw) => 2.2 * Math.sqrt(pw / 12000);
 const antHalfW = (ft) => (ft * 0.3048) / 2;
 const cantLenCalc = (pw, ft) => { const rr = radE(pw); const hw = antHalfW(ft); return Math.max(1.0, 0.8 + hw + rr + 0.5); };
+// Scanner weight: use spec sheet value when preset selected, estimate from aperture otherwise
+// Pedestal/motor base is ~25kg for small, ~40kg for large - separate from scanner
 const scannerWt = (preset, ft, radars) => {
   if (preset) { const r = (radars || DEFAULT_RADARS).find(x => x.id === preset); if (r) return r.wt; }
+  // estimate from aperture when custom: interpolate from spec data
+  // 6ft=33kg, 6.5ft=51-61kg, 12ft=134-150kg, 13ft=190kg
   if (ft <= 6) return 33;
   if (ft <= 6.5) return 33 + (ft - 6) * (61 - 33) / 0.5;
   if (ft <= 8) return 61 + (ft - 6.5) * (80 - 61) / 1.5;
@@ -162,15 +218,24 @@ const scannerWt = (preset, ft, radars) => {
 const pedestalWt = (ft) => ft <= 8 ? 25 : ft <= 12 ? 35 : 45;
 const pedHt = (ft) => ft <= 6.5 ? 1.2 : ft <= 8 ? 1.6 : ft <= 12 ? 2.4 : 3.0;
 const pedWd = (ft) => ft <= 6.5 ? 0.35 : ft <= 8 ? 0.45 : ft <= 12 ? 0.6 : 0.7;
+// Structural steel cost per platform (aligned to project estimate):
+// Engineering: $150k / 4 platforms = $37.5k per platform (common scope)
+// X-Band fabrication: ~$60k per platform (0.5t, pedestal + cantilever + decking)
+// S-Band fabrication: ~$150k per platform (2.5x multiplier for 12ft+ antenna steel)
+// Interpolate between X-Band and S-Band based on aperture
 const stBase = (ft) => {
-  const engPerPlat = 37500;
-  const xFab = 60000;
-  const sFab = 150000;
-  if (ft <= 8) return engPerPlat + xFab;
-  if (ft >= 12) return engPerPlat + sFab;
+  const engPerPlat = 37500; // $150k engineering / 4 platforms
+  const xFab = 60000;       // X-Band fabrication per platform
+  const sFab = 150000;      // S-Band fabrication per platform (2.5x)
+  if (ft <= 8) return engPerPlat + xFab; // standard X-Band
+  if (ft >= 12) return engPerPlat + sFab; // full S-Band
+  // interpolate 8-12ft
   const frac = (ft - 8) / 4;
   return engPerPlat + xFab + frac * (sFab - xFab);
 };
+// Cantilever premium: additional cost above 1.0m baseline for extended cantilever
+// Covers structural steel extension + decking (grating + handrails + kickplate)
+// $36k/m marginal cost above baseline (steel $28k/m + decking $8k/m)
 const cantCost = (cl) => cl <= 1 ? 0 : (cl - 1) * 36000;
 const pwPrem = (pw) => pw <= 150 ? 0 : pw <= 250 ? 15000 : pw <= 400 ? 35000 : pw <= 600 ? 50000 : 75000;
 const closestV = (rcs) => { let b = VESSELS[0], d = Infinity; VESSELS.forEach(v => { const dd = Math.abs(Math.log10(v.rcs_x) - Math.log10(Math.max(1, rcs))); if (dd < d) { d = dd; b = v; } }); return b; };
@@ -210,6 +275,8 @@ function TCPAChart({ effR, hz, rNM, sp }) {
   const ref = useRef(null);
   const cRef = useRef(null);
   const tcpa = (effR / sp) * 60;
+
+  // dynamic axis limits
   const xMax = Math.max(30, Math.ceil(Math.max(rNM, hz, effR) / 5) * 5 + 5);
   const yMax = Math.max(120, Math.ceil(tcpa / 20) * 20 + 20);
 
@@ -241,11 +308,13 @@ function TCPAChart({ effR, hz, rNM, sp }) {
     if (!cRef.current) return;
     cRef.current.data.datasets[0].data = [{ x: effR, y: tcpa }];
     cRef.current.data.datasets[1].data = [{ x: hz, y: 0 }, { x: hz, y: yMax }];
+    // update threshold lines to extend to new xMax
     [2, 3, 4, 5].forEach(i => {
       const yVal = cRef.current.data.datasets[i].data[0].y;
       cRef.current.data.datasets[i].data = [{ x: 0, y: yVal }, { x: xMax, y: yVal }];
     });
     cRef.current.data.datasets[6].data = [{ x: rNM, y: 0 }, { x: rNM, y: yMax }];
+    // update axis limits
     cRef.current.options.scales.x.max = xMax;
     cRef.current.options.scales.y.max = yMax;
     cRef.current.update("none");
@@ -254,12 +323,15 @@ function TCPAChart({ effR, hz, rNM, sp }) {
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <canvas ref={ref} />
+      {/* Op. point label - offset above and right of the dot */}
       <div style={{ position: "absolute", left: `${(effR / xMax) * 88 + 8}%`, top: `${(1 - tcpa / yMax) * 82 + 4}%`, transform: "translate(10px, -18px)", fontSize: 10, fontWeight: 500, color: "var(--text-1)", whiteSpace: "nowrap", pointerEvents: "none" }}>
         {effR.toFixed(1)} NM / {tcpa.toFixed(0)} min
       </div>
+      {/* Noise-limited range label - offset right of the dashed line, near top */}
       <div style={{ position: "absolute", left: `${(rNM / xMax) * 88 + 8}%`, top: "5%", transform: "translateX(8px)", fontSize: 9, color: "var(--text-1)", opacity: 0.8, whiteSpace: "nowrap", pointerEvents: "none", writingMode: "vertical-rl", letterSpacing: "1.5px" }}>
         Noise {rNM.toFixed(1)} NM
       </div>
+      {/* Horizon label - offset right of the dashed line, at top */}
       <div style={{ position: "absolute", left: `${(hz / xMax) * 88 + 8}%`, top: "5%", transform: "translateX(8px)", fontSize: 9, color: "var(--text-1)", opacity: 0.8, whiteSpace: "nowrap", pointerEvents: "none", writingMode: "vertical-rl", letterSpacing: "1.5px" }}>
         Horizon
       </div>
@@ -276,6 +348,8 @@ function VesselPanel({ rcs, bw, effR, pw, ha, apt, onSetRcs, band, rainRate, sea
     return { v, range: env.effR, hz: env.hz, limF: env.limFactor };
   }), [pw, Ga, ha, band, bw, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes]);
 
+  // dynamic scale: ensure horizon labels never overlap the detection range values
+  // horizon label sits at hzW%. Keep max horizon at most ~95% of bar width.
   const maxHz = Math.max(...det.map(d => d.hz));
   const maxDet = Math.max(...det.map(d => d.range));
   const maxR = Math.max(10, Math.ceil(Math.max(maxDet, maxHz / 0.95) / 5) * 5);
@@ -337,12 +411,16 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
   const seaY = 280, ppm = Math.min((seaY - 40) / ha, 6), dkY = seaY - ha * ppm;
   const rr = radE(pw), hwM = antHalfW(ft), cl = cantLenCalc(pw, ft), awm = ft * 0.3048;
   const pedH = pedHt(ft);
+
+  // px/m for topsides and detail geometry - sized so 30m deck ~ 105px
   const mpp = 3.5;
   const clpx = cl * mpp;
   const awpx = Math.max(4, awm * mpp);
   const hwpx = awpx / 2;
   const rrpx = rr * mpp;
   const phx = Math.max(3, pedH * mpp);
+
+  // platform topsides proportional to mpp
   const deckW = 30 * mpp;
   const pX = 45;
   const deckRight = pX + deckW;
@@ -354,25 +432,36 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
   const heliH = Math.max(1.5, 0.3 * mpp);
   const eqW = 8 * mpp;
   const eqH = 4 * mpp;
+
+  // cantilever from deck edge
   const cantStartX = deckRight;
   const atX = cantStartX + clpx;
   const cantBaseY = dkY - 1;
   const atY = cantBaseY - phx - 3;
   const antH = Math.max(1.5, 0.15 * mpp);
   const labelX = Math.max(atX + awpx / 2 + 10, atX + 14);
+
+  // vessel at fixed position
+  // height uses ppm (same as platform ASL) so height is proportional to platform
+  // length uses a separate scale to show full LOA visually (mpp would make large ships huge)
   const cv = closestV(rcs);
   const tcpa = (effR / sp) * 60;
   const vesselFixedX = 470;
-  const loaScale = 0.4;
-  const shipLen = Math.max(8, cv.loa * loaScale);
-  const shipTotalH = cv.height * ppm;
+  const loaScale = 0.4; // px per metre for vessel length
+  const shipLen = Math.max(8, cv.loa * loaScale); // full LOA in px
+  const shipTotalH = cv.height * ppm; // height ASL proportional to platform
   const shipDraft = shipTotalH * 0.3;
   const shipFreeboard = shipTotalH - shipDraft;
   const hullTop = seaY - shipFreeboard;
   const hullBot = seaY + shipDraft;
+  // vessel oriented broadside (side profile showing full length)
   const sternX = vesselFixedX - shipLen / 2;
   const bowX = vesselFixedX + shipLen / 2;
+  const beamTarget = seaY; // beam line from antenna aims at vessel centre waterline
+
   const dimY = seaY + 28;
+
+  // horizon as vertical line to the RIGHT of the vessel
   const hzX = bowX + 30;
 
   return (
@@ -380,12 +469,16 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
       <rect x="0" y="0" width="580" height={seaY} fill="var(--sky)" />
       <rect x="0" y={seaY} width="580" height="60" fill="var(--sea)" />
       <line x1="0" y1={seaY} x2="580" y2={seaY} stroke="var(--sea-line)" strokeWidth="0.7" />
+
+      {/* jacket legs and bracing */}
       <rect x={pX} y={dkY} width={deckW} height={Math.max(2, 0.5 * mpp)} rx="1.5" fill="var(--plat)" />
       <line x1={pX + 2 * mpp} y1={dkY + 2} x2={pX + 0.5 * mpp} y2={seaY} stroke="var(--steel)" strokeWidth="2" />
       <line x1={deckRight - 2 * mpp} y1={dkY + 2} x2={deckRight - 0.5 * mpp} y2={seaY} stroke="var(--steel)" strokeWidth="2" />
       <line x1={cx} y1={dkY + 2} x2={cx} y2={seaY} stroke="var(--steel)" strokeWidth="1" />
       <line x1={pX + 4 * mpp} y1={dkY + 2 + (seaY - dkY - 2) * 0.35} x2={deckRight - 4 * mpp} y2={dkY + 2 + (seaY - dkY - 2) * 0.35} stroke="var(--steel)" strokeWidth="0.6" />
       <line x1={pX + 3 * mpp} y1={dkY + 2 + (seaY - dkY - 2) * 0.65} x2={deckRight - 3 * mpp} y2={dkY + 2 + (seaY - dkY - 2) * 0.65} stroke="var(--steel)" strokeWidth="0.6" />
+
+      {/* topsides - proportional, clamped to viewport */}
       {(() => {
         const clampY = (y) => Math.max(4, y);
         const lqYc = clampY(lqY);
@@ -400,29 +493,44 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
           {heliYc > 8 && <text x={cx} y={heliYc - 2} textAnchor="middle" fontSize="5" fill="var(--text-2)">Helideck</text>}
         </>;
       })()}
+
+      {/* walkway at deck edge */}
       <rect x={deckRight - 1 * mpp} y={dkY - Math.max(0.5, 0.1 * mpp)} width={1 * mpp} height={Math.max(0.5, 0.1 * mpp)} rx="0.3" fill="var(--plat)" opacity="0.5" />
+
+      {/* cantilever arm with decking */}
       {(() => {
-        const deckingH = Math.max(0.6, 0.05 * mpp);
-        const railH = Math.max(1.5, 1.0 * mpp);
+        const deckingW = 0.8 * mpp; // 0.8m wide grating
+        const deckingH = Math.max(0.6, 0.05 * mpp); // thin grating
+        const railH = Math.max(1.5, 1.0 * mpp); // 1.0m handrail height
         return <>
+          {/* structural beam */}
           <line x1={cantStartX} y1={cantBaseY} x2={atX} y2={cantBaseY} stroke="var(--steel)" strokeWidth="1.2" />
+          {/* decking / grating */}
           <rect x={cantStartX} y={cantBaseY - deckingH} width={clpx} height={deckingH} rx="0.3" fill="var(--steel)" opacity="0.3" />
+          {/* handrails */}
           <line x1={cantStartX} y1={cantBaseY - railH} x2={atX} y2={cantBaseY - railH} stroke="var(--steel)" strokeWidth="0.3" opacity="0.35" />
+          {/* rail stanchions */}
           {Array.from({length: Math.max(2, Math.round(clpx / 8))}).map((_, i, a) => {
             const sx = cantStartX + i * (clpx / (a.length - 1));
             return <line key={`st${i}`} x1={sx} y1={cantBaseY} x2={sx} y2={cantBaseY - railH} stroke="var(--steel)" strokeWidth="0.3" opacity="0.3" />;
           })}
         </>;
       })()}
+      {/* pedestal */}
       <line x1={atX} y1={cantBaseY} x2={atX} y2={atY + 1.5} stroke="var(--steel)" strokeWidth="1.2" />
+      {/* antenna */}
       <rect x={atX - awpx / 2} y={atY} width={awpx} height={antH} rx="0.5" fill="var(--accent)" />
+
+      {/* RADHAZ from element edges */}
       {rrpx > 0.5 && <>
         <ellipse cx={atX - hwpx} cy={atY + antH / 2} rx={rrpx} ry={rrpx} fill="var(--rad-fill)" stroke="var(--rad-stroke)" strokeWidth="0.4" strokeDasharray="2 2" />
         <ellipse cx={atX + hwpx} cy={atY + antH / 2} rx={rrpx} ry={rrpx} fill="var(--rad-fill)" stroke="var(--rad-stroke)" strokeWidth="0.4" strokeDasharray="2 2" />
         {awpx > rrpx * 2 && <rect x={atX - hwpx} y={atY + antH / 2 - rrpx} width={awpx} height={rrpx * 2} fill="var(--rad-fill)" />}
       </>}
+
+      {/* radar labels - clamped to stay on screen */}
       {(() => {
-        const minLabelY = 12;
+        const minLabelY = 12; // never above this
         const radarLabelY = Math.max(minLabelY, atY - 22);
         const radhazLabelY = Math.max(minLabelY + 12, atY - 10);
         return <>
@@ -435,21 +543,29 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
           {rrpx <= 0.5 && <text x={labelX} y={radhazLabelY} fontSize="6.5" fill="var(--ok)">{rr.toFixed(2)}m RADHAZ (negligible)</text>}
         </>;
       })()}
+
+      {/* cantilever dimension */}
       <line x1={cantStartX} y1={cantBaseY + 10} x2={atX} y2={cantBaseY + 10} stroke="var(--text-2)" strokeWidth="0.35" />
       <line x1={cantStartX} y1={cantBaseY + 7} x2={cantStartX} y2={cantBaseY + 13} stroke="var(--text-2)" strokeWidth="0.35" />
       <line x1={atX} y1={cantBaseY + 7} x2={atX} y2={cantBaseY + 13} stroke="var(--text-2)" strokeWidth="0.35" />
       <text x={(cantStartX + atX) / 2} y={cantBaseY + 20} textAnchor="middle" fontSize="7" fill="var(--text-1)">{cl.toFixed(2)}m cantilever</text>
       <text x={(cantStartX + atX) / 2} y={cantBaseY + 28} textAnchor="middle" fontSize="5.5" fill="var(--text-2)">0.8 walk + {hwM.toFixed(2)} half-ant + {rr.toFixed(2)} zone + 0.5 gap</text>
+
+      {/* segment ticks */}
       {cl > 1.2 && <>
         <line x1={cantStartX + 0.8 * mpp} y1={cantBaseY - 2} x2={cantStartX + 0.8 * mpp} y2={cantBaseY + 2} stroke="var(--text-2)" strokeWidth="0.3" opacity="0.4" />
         <line x1={atX - hwpx - rrpx} y1={cantBaseY - 2} x2={atX - hwpx - rrpx} y2={cantBaseY + 2} stroke="var(--rad-stroke)" strokeWidth="0.3" opacity="0.5" />
         <line x1={atX - hwpx} y1={cantBaseY - 2} x2={atX - hwpx} y2={cantBaseY + 2} stroke="var(--accent)" strokeWidth="0.3" opacity="0.5" />
         <line x1={atX + hwpx} y1={cantBaseY - 2} x2={atX + hwpx} y2={cantBaseY + 2} stroke="var(--accent)" strokeWidth="0.3" opacity="0.5" />
       </>}
+
+      {/* ASL dimension */}
       <line x1="20" y1={dkY} x2="20" y2={seaY} stroke="var(--text-2)" strokeWidth="0.4" />
       <line x1="16" y1={dkY} x2="24" y2={dkY} stroke="var(--text-2)" strokeWidth="0.4" />
       <line x1="16" y1={seaY} x2="24" y2={seaY} stroke="var(--text-2)" strokeWidth="0.4" />
       <text x="17" y={(dkY + seaY) / 2} textAnchor="middle" fontSize="7" fill="var(--text-1)" transform={`rotate(-90,17,${(dkY + seaY) / 2})`}>{ha.toFixed(1)}m ASL</text>
+
+      {/* radar horizon - VERTICAL line, label at vertical midpoint */}
       {(() => {
         const midY = seaY / 2;
         return <>
@@ -458,17 +574,39 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
           <text x={hzX} y={midY + 2.5} textAnchor="middle" fontSize="6.5" fill="var(--cr)" fontWeight="500">Horizon {hz.toFixed(1)} NM</text>
         </>;
       })()}
+
+      {/* detection beam from antenna to vessel */}
       <line x1={atX} y1={atY + antH / 2} x2={vesselFixedX} y2={hullTop} stroke="var(--accent)" strokeWidth="0.6" strokeDasharray="4 3" opacity="0.4" />
+
+      {/* vessel - full side profile */}
       {(() => {
         const fb = shipFreeboard;
         const dr = shipDraft;
         const L = shipLen;
         const wl = seaY;
         const dkV = wl - fb;
+
+        // bow and stern sheer
         const bowRise = fb * 0.35;
         const sternRise = fb * 0.1;
         const bowRake = L * 0.05;
-        const hull = `M ${sternX},${dkV - sternRise} Q ${sternX + L * 0.03},${dkV} ${sternX + L * 0.06},${dkV} L ${bowX - L * 0.12},${dkV} Q ${bowX - L * 0.05},${dkV} ${bowX},${dkV - bowRise} L ${bowX + bowRake},${dkV - bowRise - fb * 0.08} Q ${bowX + bowRake * 0.8},${wl - fb * 0.1} ${bowX + bowRake * 0.3},${wl} L ${bowX - L * 0.02},${wl + dr * 0.4} Q ${bowX - L * 0.08},${wl + dr} ${vesselFixedX},${wl + dr} Q ${sternX + L * 0.1},${wl + dr} ${sternX + L * 0.02},${wl + dr * 0.6} Q ${sternX - L * 0.01},${wl + dr * 0.15} ${sternX - L * 0.02},${wl} Q ${sternX - L * 0.02},${wl - fb * 0.05} ${sternX},${dkV - sternRise} Z`;
+
+        // single smooth hull path: stern -> deck -> bow tip -> waterline -> keel -> back to stern
+        const hull = `
+          M ${sternX},${dkV - sternRise}
+          Q ${sternX + L * 0.03},${dkV} ${sternX + L * 0.06},${dkV}
+          L ${bowX - L * 0.12},${dkV}
+          Q ${bowX - L * 0.05},${dkV} ${bowX},${dkV - bowRise}
+          L ${bowX + bowRake},${dkV - bowRise - fb * 0.08}
+          Q ${bowX + bowRake * 0.8},${wl - fb * 0.1} ${bowX + bowRake * 0.3},${wl}
+          L ${bowX - L * 0.02},${wl + dr * 0.4}
+          Q ${bowX - L * 0.08},${wl + dr} ${vesselFixedX},${wl + dr}
+          Q ${sternX + L * 0.1},${wl + dr} ${sternX + L * 0.02},${wl + dr * 0.6}
+          Q ${sternX - L * 0.01},${wl + dr * 0.15} ${sternX - L * 0.02},${wl}
+          Q ${sternX - L * 0.02},${wl - fb * 0.05} ${sternX},${dkV - sternRise}
+          Z`;
+
+        // superstructure - aft positioned
         const ssStart = sternX + L * 0.06;
         const ssEnd = sternX + L * 0.3;
         const ssW = ssEnd - ssStart;
@@ -478,49 +616,84 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
         const deck1Top = dkV - deck1H;
         const deck2Top = deck1Top - deck2H;
         const bridgeTop = deck2Top - bridgeH;
+
+        // funnel
         const funnelCx = ssStart + ssW * 0.6;
         const funnelW = Math.max(2, ssW * 0.18);
         const funnelH = fb * 0.35;
+
+        // mast
         const mastX_ = ssStart + ssW * 0.3;
         const mastTop_ = bridgeTop - fb * 0.4;
+
+        // forward mast
         const fwdMastX_ = sternX + L * 0.55;
         const fwdMastTop_ = dkV - fb * 0.55;
+
+        // cargo holds
         const holdStart = ssEnd + L * 0.03;
         const holdEnd = bowX - L * 0.15;
         const holdH = fb * 0.15;
         const nHolds = cv.loa > 60 ? (cv.loa > 120 ? 4 : 3) : (cv.loa > 30 ? 2 : 0);
         const holdGap = nHolds > 0 ? (holdEnd - holdStart) / nHolds : 0;
+
         return <>
+          {/* hull */}
           <path d={hull} fill={cv.color} opacity="0.5" stroke={cv.color} strokeWidth="0.5" strokeLinejoin="round" />
+
+          {/* waterline */}
           <line x1={sternX - L * 0.02} y1={wl} x2={bowX + bowRake * 0.3} y2={wl} stroke={cv.color} strokeWidth="0.6" opacity="0.6" />
+
+          {/* deck line */}
           <line x1={sternX + L * 0.06} y1={dkV} x2={bowX - L * 0.12} y2={dkV} stroke={cv.color} strokeWidth="0.3" opacity="0.35" />
+
+          {/* accommodation deck 1 */}
           <rect x={ssStart} y={deck1Top} width={ssW} height={deck1H} rx="0.6" fill={cv.color} opacity="0.65" />
+          {/* portholes */}
           {L > 18 && Array.from({length: Math.min(5, Math.max(2, Math.floor(ssW / 3.5)))}).map((_, i, a) => (
             <circle key={`p${i}`} cx={ssStart + ssW * 0.1 + i * (ssW * 0.8) / (a.length - 1 || 1)} cy={deck1Top + deck1H * 0.5} r={0.5} fill="var(--sky)" opacity="0.25" />
           ))}
+
+          {/* deck 2 */}
           <rect x={ssStart + ssW * 0.06} y={deck2Top} width={ssW * 0.88} height={deck2H} rx="0.6" fill={cv.color} opacity="0.7" />
+
+          {/* bridge */}
           <rect x={ssStart + ssW * 0.12} y={bridgeTop} width={ssW * 0.72} height={bridgeH} rx="0.6" fill={cv.color} opacity="0.8" />
+          {/* bridge windows */}
           <rect x={ssStart + ssW * 0.15} y={bridgeTop + Math.max(0.8, bridgeH * 0.1)} width={ssW * 0.66} height={Math.max(1, bridgeH * 0.2)} rx="0.3" fill="var(--sky)" opacity="0.45" />
+          {/* bridge wings */}
           {L > 15 && <>
             <line x1={ssStart + ssW * 0.12} y1={bridgeTop + bridgeH * 0.5} x2={ssStart - L * 0.008} y2={bridgeTop + bridgeH * 0.5} stroke={cv.color} strokeWidth="0.4" opacity="0.5" />
             <line x1={ssStart + ssW * 0.84} y1={bridgeTop + bridgeH * 0.5} x2={ssEnd + L * 0.008} y2={bridgeTop + bridgeH * 0.5} stroke={cv.color} strokeWidth="0.4" opacity="0.5" />
           </>}
+
+          {/* funnel */}
           {L > 12 && <>
             <rect x={funnelCx - funnelW / 2} y={bridgeTop - funnelH} width={funnelW} height={funnelH} rx="0.5" fill={cv.color} opacity="0.7" />
             <rect x={funnelCx - funnelW * 0.65 / 2} y={bridgeTop - funnelH - 0.4} width={funnelW * 0.65} height={0.6} rx="0.2" fill={cv.color} opacity="0.4" />
           </>}
+
+          {/* main mast */}
           <line x1={mastX_} y1={bridgeTop} x2={mastX_} y2={mastTop_} stroke={cv.color} strokeWidth="0.5" />
           <line x1={mastX_ - L * 0.012} y1={mastTop_ + 0.4} x2={mastX_ + L * 0.012} y2={mastTop_ + 0.4} stroke={cv.color} strokeWidth="0.4" />
+
+          {/* forward mast */}
           {L > 22 && <>
             <line x1={fwdMastX_} y1={dkV} x2={fwdMastX_} y2={fwdMastTop_} stroke={cv.color} strokeWidth="0.4" />
             <line x1={fwdMastX_ - L * 0.01} y1={fwdMastTop_ + 0.4} x2={fwdMastX_ + L * 0.01} y2={fwdMastTop_ + 0.4} stroke={cv.color} strokeWidth="0.3" />
           </>}
+
+          {/* cargo holds */}
           {nHolds > 0 && Array.from({length: nHolds}).map((_, i) => (
             <rect key={`h${i}`} x={holdStart + i * holdGap + holdGap * 0.1} y={dkV - holdH} width={holdGap * 0.78} height={holdH} rx="0.3" fill={cv.color} opacity="0.28" />
           ))}
+
+          {/* bow wave */}
           <path d={`M ${bowX + bowRake * 0.3 + 0.5},${wl - 0.3} Q ${bowX + bowRake + L * 0.03},${wl - 1.2} ${bowX + bowRake + L * 0.06},${wl}`} fill="none" stroke="var(--sea-line)" strokeWidth="0.4" opacity="0.3" />
         </>;
       })()}
+
+      {/* vessel label */}
       {(() => {
         const fb = shipFreeboard;
         const dkV = seaY - fb;
@@ -528,14 +701,30 @@ function PlatformSVG({ ha, ft, pw, effR, hz, rcs, sp, preset: ap_, radars: radar
         const topFeature = Math.min(bridgeTopA - fb * 0.4, bridgeTopA - fb * 0.35);
         return <>
           <text x={vesselFixedX} y={topFeature - 5} textAnchor="middle" fontSize="7" fill="var(--text-1)" fontWeight="500">{cv.label}</text>
-          <text x={vesselFixedX} y={topFeature + 1} textAnchor="middle" fontSize="6" fill="var(--text-2)">LOA {cv.loa}m | Ht {cv.height}m | RCS {cv.rcs_x.toLocaleString()}m² | T{cv.type}</text>
+          <text x={vesselFixedX} y={topFeature + 1} textAnchor="middle" fontSize="6" fill="var(--text-2)">LOA {cv.loa}m | RCS {cv.rcs_x.toLocaleString()}m² | T{cv.type}</text>
         </>;
       })()}
+
+      {/* vessel height ASL dimension */}
+      {(() => {
+        const dimX = bowX + 12;
+        const topY = seaY - cv.height * ppm; // top of vessel at ppm scale
+        return <>
+          <line x1={dimX} y1={seaY} x2={dimX} y2={topY} stroke="var(--text-2)" strokeWidth="0.4" />
+          <line x1={dimX - 3} y1={seaY} x2={dimX + 3} y2={seaY} stroke="var(--text-2)" strokeWidth="0.4" />
+          <line x1={dimX - 3} y1={topY} x2={dimX + 3} y2={topY} stroke="var(--text-2)" strokeWidth="0.4" />
+          <text x={dimX + 3} y={(seaY + topY) / 2 + 1} fontSize="7" fill="var(--text-1)" dominantBaseline="central">{cv.height}m</text>
+        </>;
+      })()}
+
+      {/* detection range dimension - aligned to horizon line */}
       <line x1={atX} y1={dimY} x2={hzX} y2={dimY} stroke="var(--accent)" strokeWidth="0.5" />
       <line x1={atX} y1={dimY - 3} x2={atX} y2={dimY + 3} stroke="var(--accent)" strokeWidth="0.5" />
       <line x1={hzX} y1={dimY - 3} x2={hzX} y2={dimY + 3} stroke="var(--accent)" strokeWidth="0.5" />
       <rect x={(atX + hzX) / 2 - 50} y={dimY - 5.5} width="100" height="11" rx="3" fill="var(--bg-2)" />
       <text x={(atX + hzX) / 2} y={dimY + 2} textAnchor="middle" fontSize="7" fill="var(--accent)" fontWeight="500">{effR.toFixed(1)} NM detection ({limFactor}-lim)</text>
+
+      {/* TCPA callout */}
       <rect x={(atX + hzX) / 2 - 40} y={dimY + 6.5} width="80" height="10" rx="3" fill={tcpa >= 50 ? "var(--ok-bg)" : tcpa >= 25 ? "var(--wn-bg)" : "var(--cr-bg)"} />
       <text x={(atX + hzX) / 2} y={dimY + 14} textAnchor="middle" fontSize="6.5" fill={tcpa >= 50 ? "var(--ok)" : tcpa >= 25 ? "var(--wn)" : "var(--cr)"} fontWeight="500">{tcpa.toFixed(1)} min TCPA at {sp} kn</text>
     </svg>
@@ -554,10 +743,19 @@ function App() {
   const [radars, setRadars] = useState(DEFAULT_RADARS);
   const [showAdd, setShowAdd] = useState(false);
   const [newR, setNewR] = useState({ name: "", band: "X", pw: 100, apt: 6, bw: 1.3, wt: 30, cost: 30000, iec: "None", wind: 100, tech: "", techClass: "ss_doppler" });
+  // environment
   const [rainOn, setRainOn] = useState(false);
-  const [rainRate, setRainRate] = useState(34.7);
+  const [rainRate, setRainRate] = useState(34.7); // mm/hr, ITU-R P.837-7 R0.01 at TNA
   const [clutterOn, setClutterOn] = useState(false);
-  const [seaState, setSeaState] = useState(4);
+  const [seaState, setSeaState] = useState(4); // SS4 = P90 design case
+
+  useEffect(() => {
+    if (!document.querySelector('script[src*="chart.umd"]')) {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js";
+      document.head.appendChild(s);
+    }
+  }, []);
 
   const selP = useCallback((id) => {
     const r = radars.find(x => x.id === id); if (!r) return;
@@ -566,7 +764,8 @@ function App() {
   const clrP = useCallback(() => setAp(null), []);
 
   const Ga = GfnBand(apt, band);
-  const ht = tHfn(rcs);
+  const ht = closestV(rcs).height; // use actual vessel height for horizon calc
+  // derive techClass from active preset, default to ss_doppler for custom
   const techClass = ap ? (radars.find(r => r.id === ap)?.techClass || "ss_doppler") : "ss_doppler";
   const presetRangeRes = ap ? (radars.find(r => r.id === ap)?.rangeRes || null) : null;
   const env = effRangeWithEnv(pw, Ga, rcs, band, bw, ha, ht, rainRate, seaState, rainOn, clutterOn, techClass, presetRangeRes);
@@ -575,8 +774,10 @@ function App() {
   const beamM = effR * 1852 * bw * Math.PI / 180;
   const rR = radE(pw), hw = antHalfW(apt), cL = cantLenCalc(pw, apt);
   const sb = stBase(apt), cc = cantCost(cL), rc = unitCost(ap, apt, pw, radars), pp = pwPrem(pw), per = sb + cc + rc + pp;
+  // Cantilever: structural steel beam + decking (grating/chequerplate) for maintenance access
+  // Steel beam: ~18 kg/m, Decking: ~0.8m wide galv grating at ~25 kg/m² = ~20 kg/m length
   const cantSteelW = Math.round(cL * 18);
-  const cantDeckW = Math.round(cL * 20);
+  const cantDeckW = Math.round(cL * 20); // 0.8m wide grating at ~25 kg/m²
   const cantW = cantSteelW + cantDeckW;
   const scanW = Math.round(scannerWt(ap, apt, radars)), pedW_ = pedestalWt(apt), totW = scanW + pedW_ + cantW;
   const preset = ap ? radars.find(r => r.id === ap) : null;
